@@ -1,0 +1,14 @@
+services:
+  watched-cleanup:
+    build: .
+    container_name: watched-cleanup
+    user: "992:114"
+    ports:
+      - "6969:6969"
+    volumes:
+      - /data:/data
+    environment:
+      - JELLYFIN_BASE_URL="http://192.168.1.238:8096/"
+      - JELLYFIN_API_KEY="3ac377d146de4471aac66f330a7e2968"
+      - JELLYFIN_USER_ID="470bcfb2d5db4f2fbadd795f49e2daf2"
+    restart: unless-stopped

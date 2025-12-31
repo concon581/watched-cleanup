@@ -6,9 +6,12 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -83,13 +86,13 @@ type RefreshProgress struct {
 }
 
 var (
-	cachedMovies     MovieList
-	cachedSeries     []Series
-	isRefreshing     bool
-	lastRefresh      time.Time
-	cacheMutex       sync.RWMutex
-	refreshProgress  RefreshProgress
-	progressMutex    sync.RWMutex
+	cachedMovies    MovieList
+	cachedSeries    []Series
+	isRefreshing    bool
+	lastRefresh     time.Time
+	cacheMutex      sync.RWMutex
+	refreshProgress RefreshProgress
+	progressMutex   sync.RWMutex
 )
 
 var htmlTemplate = `
@@ -490,13 +493,14 @@ func main() {
 	http.HandleFunc("/refresh-tv", handleRefreshTV)
 	http.HandleFunc("/refresh-status", handleRefreshStatus)
 	http.HandleFunc("/delete", handleDelete)
-	
-	fmt.Println("Server starting on :8080")
-	http.ListenAndServe(":8080", nil)
+	fmt.Println("watched-cleanup v1.0.1 - hardlink test starting...")
+	fmt.Println("Server starting on :6969")
+	http.ListenAndServe(":6969", nil)
+
 }
 
 func fetchAPI(request_type string, id string) ([]byte, error) {
-	jellyfin_user_id := "470bcfb2d5db4f2fbadd795f49e2daf2"
+	jellyfin_user_id := os.Getenv("JELLYFIN_USER_ID")
 
 	var api string
 	if request_type == "played_movies" {
@@ -519,14 +523,17 @@ func fetchAPI(request_type string, id string) ([]byte, error) {
 		api = "Users/" + jellyfin_user_id + "/Items/" + id
 	}
 
-	baseurl := "http://nas.home.arpa:8096/"
+	baseurl := os.Getenv("JELLYFIN_BASE_URL")
+
 	url := baseurl + api
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "MediaBrowser Token=\"3ac377d146de4471aac66f330a7e2968\"")
+	token := os.Getenv("JELLYFIN_API_KEY")
+
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -617,13 +624,13 @@ func handleRefreshMovies(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Starting movie refresh...")
 		updateProgress(0, 0, "Fetching movie list...")
 		newMovies := fetchMovieData()
-		
+
 		cacheMutex.Lock()
 		cachedMovies = newMovies
 		lastRefresh = time.Now()
 		isRefreshing = false
 		cacheMutex.Unlock()
-		
+
 		fmt.Println("Movie refresh complete!")
 	}()
 
@@ -644,13 +651,13 @@ func handleRefreshTV(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Starting TV refresh...")
 		updateProgress(0, 0, "Fetching episode list...")
 		newSeries := fetchTVData()
-		
+
 		cacheMutex.Lock()
 		cachedSeries = newSeries
 		lastRefresh = time.Now()
 		isRefreshing = false
 		cacheMutex.Unlock()
-		
+
 		fmt.Println("TV refresh complete!")
 	}()
 
@@ -674,22 +681,202 @@ func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 		"total":        progress.Total,
 	})
 }
+func callJellyfinDelete(id string) {
+	baseurl := os.Getenv("JELLYFIN_BASE_URL")
+	token := os.Getenv("JELLYFIN_API_KEY")
+	url := fmt.Sprintf("%sItems/%s", baseurl, id)
+
+	req, _ := http.NewRequest("DELETE", url, nil)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+// Add this function to find hardlinks by inode
+func findHardlinks(targetPath string, searchDir string) ([]string, error) {
+	// Get the inode of the target file
+	targetInfo, err := os.Stat(targetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	targetStat, ok := targetInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("failed to get stat info")
+	}
+	targetInode := targetStat.Ino
+
+	var matches []string
+
+	// Walk the search directory
+	err = filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors, continue walking
+		}
+
+		if info.IsDir() {
+			return nil // Skip directories
+		}
+
+		// Get inode of current file
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+
+		// If inodes match, this is a hardlink
+		if stat.Ino == targetInode {
+			matches = append(matches, path)
+		}
+
+		return nil
+	})
+
+	return matches, err
+}
+
+// Add this function to find all files in a directory recursively
+func getAllFilesInDir(dirPath string) ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+
+		return nil
+	})
+
+	return files, err
+}
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Ids  []string `json:"ids"`
 		Type string   `json:"type"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	// TODO: Implement actual deletion logic when on server
-	// For now, just acknowledge
-	fmt.Printf("Delete request: type=%s, ids=%v\n", req.Type, req.Ids)
-	w.Write([]byte(fmt.Sprintf("Delete function not yet implemented. Would delete %d %s(s)", len(req.Ids), req.Type)))
+	var deletedHardlinks []string
+
+	for _, id := range req.Ids {
+		var filesToCheck []string
+
+		// Handle different types differently
+		if req.Type == "season" {
+			// For seasons, we need to get all episodes first
+			fmt.Printf("watched-cleanup: Fetching episodes for season %s\n", id)
+
+			seasonEpisodesBody, err := fetchAPI("season_episodes", id)
+			if err != nil {
+				fmt.Printf("  Error fetching season episodes: %v\n", err)
+				continue
+			}
+
+			var seasonEpisodes EpisodeList
+			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+				fmt.Printf("  Error unmarshaling season episodes: %v\n", err)
+				continue
+			}
+
+			fmt.Printf("  Found %d episodes in season\n", len(seasonEpisodes.Items))
+
+			// Get the path for each episode
+			for _, ep := range seasonEpisodes.Items {
+				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
+				if err != nil {
+					continue
+				}
+				var details MovieDetails
+				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+					continue
+				}
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("    Episode file: %s\n", filepath.Base(path))
+					}
+				}
+			}
+		} else if req.Type == "movie" {
+			// For movies, get the single file path
+			detailsBody, err := fetchAPI("movie_details", id)
+			if err == nil {
+				var details MovieDetails
+				json.Unmarshal(detailsBody, &details)
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("watched-cleanup: Movie file: %s\n", path)
+					}
+				}
+			}
+		}
+
+		// 2. Find and delete hardlinks for all files
+		if len(filesToCheck) > 0 {
+			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
+
+			for _, filePath := range filesToCheck {
+				// Check if file exists
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					fmt.Printf("  File doesn't exist (already deleted?): %s\n", filePath)
+					continue
+				}
+
+				hardlinks, err := findHardlinks(filePath, "/data/torrents")
+				if err != nil {
+					fmt.Printf("  Error finding hardlinks for %s: %v\n", filePath, err)
+					continue
+				}
+
+				if len(hardlinks) > 0 {
+					fmt.Printf("  Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
+					for _, link := range hardlinks {
+						fmt.Printf("    Deleting hardlink: %s\n", link)
+						if err := os.Remove(link); err != nil {
+							fmt.Printf("    Error deleting %s: %v\n", link, err)
+						} else {
+							deletedHardlinks = append(deletedHardlinks, link)
+						}
+					}
+				} else {
+					fmt.Printf("  No hardlinks found for %s\n", filepath.Base(filePath))
+				}
+
+				// Delete the original file
+				fmt.Printf("  Deleting original file: %s\n", filePath)
+				if err := os.Remove(filePath); err != nil {
+					fmt.Printf("  Error deleting original: %v\n", err)
+				}
+			}
+		}
+
+		// 3. Tell Jellyfin to delete the item from its database
+		fmt.Printf("  Deleting from Jellyfin database: %s\n", id)
+		callJellyfinDelete(id)
+	}
+
+	responseMsg := fmt.Sprintf("Successfully deleted %d %s(s)", len(req.Ids), req.Type)
+	if len(deletedHardlinks) > 0 {
+		responseMsg += fmt.Sprintf(" and %d hardlinked torrent file(s)", len(deletedHardlinks))
+	}
+
+	fmt.Printf("watched-cleanup: Complete. %s\n", responseMsg)
+	w.Write([]byte(responseMsg))
 }
 
 func fetchMovieData() MovieList {
@@ -737,7 +924,7 @@ func fetchMovieData() MovieList {
 				movieList.Items[idx].Path = details.MediaSources[0].Path
 				mu.Unlock()
 			}
-			
+
 			current := atomic.AddInt32(&completed, 1)
 			updateProgress(int(current), len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d", int(current), len(movieList.Items)))
 		}(i)
@@ -763,7 +950,7 @@ func fetchTVData() []Series {
 	fmt.Println("Unmarshaled", len(episodeList.Items), "episodes")
 
 	grouped := make(map[string]*Series)
-	
+
 	for _, ep := range episodeList.Items {
 		seriesId := ep.SeriesId
 		if grouped[seriesId] == nil {
@@ -808,34 +995,34 @@ func fetchTVData() []Series {
 	}
 
 	fmt.Println("Fetching season details for", len(grouped), "series...")
-	
+
 	totalSeries := len(grouped)
 	var seriesCompleted int32
-	
+
 	// Process each series
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	
+
 	for _, series := range grouped {
 		wg.Add(1)
 		go func(s *Series) {
 			defer wg.Done()
-			
+
 			fmt.Println("Processing series:", s.Name, "with", len(s.Seasons), "seasons")
-			
+
 			// Process seasons for this series
 			var seasonWg sync.WaitGroup
 			seasonSem := make(chan struct{}, 5) // Limit concurrent season fetches
-			
+
 			for i := range s.Seasons {
 				seasonWg.Add(1)
 				go func(idx int) {
 					defer seasonWg.Done()
 					seasonSem <- struct{}{}
 					defer func() { <-seasonSem }()
-					
+
 					fmt.Printf("  Fetching info for season %d (ID: %s)\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SeasonId)
-					
+
 					seasonInfoBody, err := fetchAPI("season_info", s.Seasons[idx].SeasonId)
 					if err != nil {
 						fmt.Println("    Error fetching season info:", err)
@@ -848,7 +1035,7 @@ func fetchTVData() []Series {
 					}
 					s.Seasons[idx].TotalCount = seasonInfo.ChildCount
 					fmt.Printf("    Season %d: %d episodes total\n", s.Seasons[idx].SeasonNumber, seasonInfo.ChildCount)
-					
+
 					seasonEpisodesBody, err := fetchAPI("season_episodes", s.Seasons[idx].SeasonId)
 					if err != nil {
 						fmt.Println("    Error fetching season episodes:", err)
@@ -859,22 +1046,22 @@ func fetchTVData() []Series {
 						fmt.Println("    Error unmarshaling season episodes:", err)
 						return
 					}
-					
+
 					fmt.Printf("    Fetching sizes for %d episodes\n", len(seasonEpisodes.Items))
-					
+
 					// Parallelize episode size fetching
 					var epWg sync.WaitGroup
 					epSem := make(chan struct{}, 10) // Limit concurrent episode fetches
 					var sizeMu sync.Mutex
 					var totalSize int64
-					
+
 					for _, ep := range seasonEpisodes.Items {
 						epWg.Add(1)
 						go func(episode Episode) {
 							defer epWg.Done()
 							epSem <- struct{}{}
 							defer func() { <-epSem }()
-							
+
 							episodeDetailsBody, err := fetchAPI("episode_details", episode.Id)
 							if err != nil {
 								return
@@ -890,26 +1077,26 @@ func fetchTVData() []Series {
 							}
 						}(ep)
 					}
-					
+
 					epWg.Wait()
 					s.Seasons[idx].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
-					
+
 					mu.Lock()
 					s.TotalSize += s.Seasons[idx].SizeGB
 					mu.Unlock()
-					
+
 					fmt.Printf("    Season %d: %.2f GB total\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SizeGB)
 				}(i)
 			}
-			
+
 			seasonWg.Wait()
-			
+
 			// Update progress after series completes
 			current := atomic.AddInt32(&seriesCompleted, 1)
 			updateProgress(int(current), totalSeries, fmt.Sprintf("Completed %d/%d series", int(current), totalSeries))
 		}(series)
 	}
-	
+
 	wg.Wait()
 
 	var seriesList []Series
