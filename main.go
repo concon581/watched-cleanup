@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 )
@@ -71,14 +72,23 @@ type Series struct {
 	Id        string
 	ImageTags map[string]string `json:"ImageTags"`
 	Seasons   []SeasonInfo
+	TotalSize float64
+}
+
+type RefreshProgress struct {
+	Current int
+	Total   int
+	Message string
 }
 
 var (
-	cachedMovies MovieList
-	cachedSeries []Series
-	isRefreshing bool
-	lastRefresh  time.Time
-	cacheMutex   sync.RWMutex
+	cachedMovies     MovieList
+	cachedSeries     []Series
+	isRefreshing     bool
+	lastRefresh      time.Time
+	cacheMutex       sync.RWMutex
+	refreshProgress  RefreshProgress
+	progressMutex    sync.RWMutex
 )
 
 var htmlTemplate = `
@@ -192,6 +202,7 @@ var htmlTemplate = `
                 .then(r => r.json())
                 .then(data => {
                     if (data.isRefreshing) {
+                        document.getElementById('status').textContent = data.message;
                         setTimeout(checkRefreshStatus, 1000);
                     } else {
                         location.reload();
@@ -241,6 +252,7 @@ var tvTemplate = `
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; }
         .refresh-btn { 
             padding: 10px 20px; 
             background: #4CAF50; 
@@ -258,7 +270,10 @@ var tvTemplate = `
             padding: 15px; 
             background: #2a2a2a;
             border-radius: 4px;
+            display: flex;
+            gap: 15px;
         }
+        .series-content { flex: 1; }
         .season { 
             margin-left: 20px; 
             padding: 10px;
@@ -282,10 +297,19 @@ var tvTemplate = `
             border-radius: 4px;
             cursor: pointer;
             font-size: 16px;
-            margin-top: 20px;
         }
         .delete-btn:disabled { background: #666; cursor: not-allowed; }
         h1 { margin: 0; }
+        select, input[type="number"] {
+            padding: 8px;
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        label { color: #aaa; font-size: 14px; }
+        .select-all { margin-left: 10px; }
     </style>
 </head>
 <body>
@@ -304,24 +328,48 @@ var tvTemplate = `
     </div>
     
     {{if .Series}}
+    <div class="controls">
+        <label>Sort by:</label>
+        <select id="sortBy" onchange="applyFilters()">
+            <option value="name">Name</option>
+            <option value="size-desc">Size (Largest First)</option>
+            <option value="size-asc">Size (Smallest First)</option>
+        </select>
+        
+        <label>Min Size (GB):</label>
+        <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
+        
+        <label>
+            <input type="checkbox" id="fullyWatched" onchange="applyFilters()">
+            Fully watched only
+        </label>
+        
+        <button class="select-all" onclick="selectAll()">Select All</button>
+        <button class="select-all" onclick="deselectAll()">Deselect All</button>
+    </div>
+    
     <button class="delete-btn" onclick="deleteSelected()">Delete Selected Seasons</button>
     
+    <div id="seriesList">
     {{range .Series}}
-    <div class="series">
-        <h2>{{.Name}}</h2>
+    <div class="series" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}">
         {{if .ImageTags.Primary}}
         <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
         {{end}}
-        {{range .Seasons}}
-        <div class="season">
-            <input type="checkbox" name="season" value="{{.SeasonId}}">
-            <div>
-                <strong>Season {{.SeasonNumber}}:</strong> {{.WatchedCount}}/{{.TotalCount}} episodes watched ({{printf "%.2f" .SizeGB}} GB)
+        <div class="series-content">
+            <h2>{{.Name}} ({{printf "%.2f" .TotalSize}} GB total)</h2>
+            {{range .Seasons}}
+            <div class="season">
+                <input type="checkbox" name="season" value="{{.SeasonId}}">
+                <div>
+                    <strong>Season {{.SeasonNumber}}:</strong> {{.WatchedCount}}/{{.TotalCount}} episodes watched ({{printf "%.2f" .SizeGB}} GB)
+                </div>
             </div>
+            {{end}}
         </div>
-        {{end}}
     </div>
     {{end}}
+    </div>
     {{else}}
     <p style="color: #aaa;">No TV shows loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
     {{end}}
@@ -332,7 +380,7 @@ var tvTemplate = `
             const status = document.getElementById('status');
             btn.disabled = true;
             btn.textContent = 'Refreshing...';
-            status.textContent = 'Fetching data from Jellyfin...';
+            status.textContent = 'Starting refresh...';
             
             fetch('/refresh-tv', { method: 'POST' })
                 .then(r => r.text())
@@ -346,11 +394,58 @@ var tvTemplate = `
                 .then(r => r.json())
                 .then(data => {
                     if (data.isRefreshing) {
+                        document.getElementById('status').textContent = data.message;
                         setTimeout(checkRefreshStatus, 1000);
                     } else {
                         location.reload();
                     }
                 });
+        }
+        
+        function applyFilters() {
+            const sortBy = document.getElementById('sortBy').value;
+            const minSize = parseFloat(document.getElementById('minSize').value) || 0;
+            const fullyWatched = document.getElementById('fullyWatched').checked;
+            
+            const container = document.getElementById('seriesList');
+            const series = Array.from(container.children);
+            
+            series.forEach(s => {
+                const size = parseFloat(s.dataset.size);
+                const isFullyWatched = s.dataset.fullyWatched === 'true';
+                
+                let show = size >= minSize;
+                if (fullyWatched && !isFullyWatched) show = false;
+                
+                s.style.display = show ? 'flex' : 'none';
+            });
+            
+            const visibleSeries = series.filter(s => s.style.display !== 'none');
+            
+            visibleSeries.sort((a, b) => {
+                if (sortBy === 'name') {
+                    return a.dataset.name.localeCompare(b.dataset.name);
+                } else if (sortBy === 'size-desc') {
+                    return parseFloat(b.dataset.size) - parseFloat(a.dataset.size);
+                } else if (sortBy === 'size-asc') {
+                    return parseFloat(a.dataset.size) - parseFloat(b.dataset.size);
+                }
+                return 0;
+            });
+            
+            visibleSeries.forEach(s => container.appendChild(s));
+        }
+        
+        function selectAll() {
+            document.querySelectorAll('input[name="season"]').forEach(cb => {
+                if (cb.closest('.series').style.display !== 'none') {
+                    cb.checked = true;
+                }
+            });
+        }
+        
+        function deselectAll() {
+            document.querySelectorAll('input[name="season"]:checked').forEach(cb => cb.checked = false);
         }
         
         function deleteSelected() {
@@ -419,6 +514,8 @@ func fetchAPI(request_type string, id string) ([]byte, error) {
 		api = "Users/" + jellyfin_user_id + "/Items/" + id
 	} else if request_type == "season_episodes" {
 		api = "Users/" + jellyfin_user_id + "/Items?ParentId=" + id + "&Fields=MediaSources"
+	} else if request_type == "series_details" {
+		api = "Users/" + jellyfin_user_id + "/Items/" + id
 	}
 
 	baseurl := "http://nas.home.arpa:8096/"
@@ -438,6 +535,16 @@ func fetchAPI(request_type string, id string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
+}
+
+func updateProgress(current, total int, message string) {
+	progressMutex.Lock()
+	refreshProgress = RefreshProgress{
+		Current: current,
+		Total:   total,
+		Message: message,
+	}
+	progressMutex.Unlock()
 }
 
 func handleMovies(w http.ResponseWriter, r *http.Request) {
@@ -460,11 +567,32 @@ func handleTV(w http.ResponseWriter, r *http.Request) {
 	cacheMutex.RLock()
 	defer cacheMutex.RUnlock()
 
+	// Calculate if each series is fully watched
+	type EnhancedSeries struct {
+		Series
+		FullyWatched bool
+	}
+
+	enhancedSeries := make([]EnhancedSeries, len(cachedSeries))
+	for i, s := range cachedSeries {
+		fullyWatched := true
+		for _, season := range s.Seasons {
+			if season.WatchedCount < season.TotalCount {
+				fullyWatched = false
+				break
+			}
+		}
+		enhancedSeries[i] = EnhancedSeries{
+			Series:       s,
+			FullyWatched: fullyWatched,
+		}
+	}
+
 	data := struct {
-		Series      []Series
+		Series      []EnhancedSeries
 		LastRefresh time.Time
 	}{
-		Series:      cachedSeries,
+		Series:      enhancedSeries,
 		LastRefresh: lastRefresh,
 	}
 
@@ -486,6 +614,7 @@ func handleRefreshMovies(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		fmt.Println("Starting movie refresh...")
+		updateProgress(0, 0, "Fetching movie list...")
 		newMovies := fetchMovieData()
 		
 		cacheMutex.Lock()
@@ -512,6 +641,7 @@ func handleRefreshTV(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		fmt.Println("Starting TV refresh...")
+		updateProgress(0, 0, "Fetching episode list...")
 		newSeries := fetchTVData()
 		
 		cacheMutex.Lock()
@@ -528,11 +658,19 @@ func handleRefreshTV(w http.ResponseWriter, r *http.Request) {
 
 func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
+	refreshing := isRefreshing
+	cacheMutex.RUnlock()
+
+	progressMutex.RLock()
+	progress := refreshProgress
+	progressMutex.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{
-		"isRefreshing": isRefreshing,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isRefreshing": refreshing,
+		"message":      progress.Message,
+		"current":      progress.Current,
+		"total":        progress.Total,
 	})
 }
 
@@ -569,6 +707,7 @@ func fetchMovieData() MovieList {
 	fmt.Println("Number of movies:", len(movieList.Items))
 
 	for i := range movieList.Items {
+		updateProgress(i+1, len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d: %s", i+1, len(movieList.Items), movieList.Items[i].Name))
 		detailsBody, err := fetchAPI("movie_details", movieList.Items[i].Id)
 		if err != nil {
 			continue
@@ -607,10 +746,24 @@ func fetchTVData() []Series {
 	for _, ep := range episodeList.Items {
 		seriesId := ep.SeriesId
 		if grouped[seriesId] == nil {
-			grouped[seriesId] = &Series{
-				Name:      ep.SeriesName,
-				Id:        seriesId,
-				ImageTags: make(map[string]string),
+			// Fetch series details to get artwork
+			seriesBody, err := fetchAPI("series_details", seriesId)
+			if err == nil {
+				var seriesDetails struct {
+					ImageTags map[string]string `json:"ImageTags"`
+				}
+				json.Unmarshal(seriesBody, &seriesDetails)
+				grouped[seriesId] = &Series{
+					Name:      ep.SeriesName,
+					Id:        seriesId,
+					ImageTags: seriesDetails.ImageTags,
+				}
+			} else {
+				grouped[seriesId] = &Series{
+					Name:      ep.SeriesName,
+					Id:        seriesId,
+					ImageTags: make(map[string]string),
+				}
 			}
 			fmt.Println("New series:", ep.SeriesName)
 		}
@@ -635,7 +788,13 @@ func fetchTVData() []Series {
 
 	fmt.Println("Fetching season details for", len(grouped), "series...")
 	
+	seriesCount := 0
+	totalSeries := len(grouped)
+	
 	for _, series := range grouped {
+		seriesCount++
+		updateProgress(seriesCount, totalSeries, fmt.Sprintf("Processing %d/%d: %s", seriesCount, totalSeries, series.Name))
+		
 		fmt.Println("Processing series:", series.Name, "with", len(series.Seasons), "seasons")
 		for i := range series.Seasons {
 			fmt.Printf("  Fetching info for season %d (ID: %s)\n", series.Seasons[i].SeasonNumber, series.Seasons[i].SeasonId)
@@ -680,6 +839,7 @@ func fetchTVData() []Series {
 				}
 			}
 			series.Seasons[i].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
+			series.TotalSize += series.Seasons[i].SizeGB
 			fmt.Printf("    Season %d: %.2f GB total\n", series.Seasons[i].SeasonNumber, series.Seasons[i].SizeGB)
 		}
 	}
@@ -688,6 +848,11 @@ func fetchTVData() []Series {
 	for _, s := range grouped {
 		seriesList = append(seriesList, *s)
 	}
+
+	// Sort by name by default
+	sort.Slice(seriesList, func(i, j int) bool {
+		return seriesList[i].Name < seriesList[j].Name
+	})
 
 	fmt.Println("Returning", len(seriesList), "series")
 	return seriesList
