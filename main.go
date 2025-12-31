@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -706,23 +707,43 @@ func fetchMovieData() MovieList {
 
 	fmt.Println("Number of movies:", len(movieList.Items))
 
+	// Parallelize movie detail fetching
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // Limit to 10 concurrent requests
+	var mu sync.Mutex
+	var completed int32
+
 	for i := range movieList.Items {
-		updateProgress(i+1, len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d: %s", i+1, len(movieList.Items), movieList.Items[i].Name))
-		detailsBody, err := fetchAPI("movie_details", movieList.Items[i].Id)
-		if err != nil {
-			continue
-		}
-		var details MovieDetails
-		if err := json.Unmarshal(detailsBody, &details); err != nil {
-			continue
-		}
-		if len(details.MediaSources) > 0 {
-			movieList.Items[i].Size = details.MediaSources[0].Size
-			movieList.Items[i].SizeGB = float64(details.MediaSources[0].Size) / (1024 * 1024 * 1024)
-			movieList.Items[i].Path = details.MediaSources[0].Path
-		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			detailsBody, err := fetchAPI("movie_details", movieList.Items[idx].Id)
+			if err != nil {
+				atomic.AddInt32(&completed, 1)
+				return
+			}
+			var details MovieDetails
+			if err := json.Unmarshal(detailsBody, &details); err != nil {
+				atomic.AddInt32(&completed, 1)
+				return
+			}
+			if len(details.MediaSources) > 0 {
+				mu.Lock()
+				movieList.Items[idx].Size = details.MediaSources[0].Size
+				movieList.Items[idx].SizeGB = float64(details.MediaSources[0].Size) / (1024 * 1024 * 1024)
+				movieList.Items[idx].Path = details.MediaSources[0].Path
+				mu.Unlock()
+			}
+			
+			current := atomic.AddInt32(&completed, 1)
+			updateProgress(int(current), len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d", int(current), len(movieList.Items)))
+		}(i)
 	}
 
+	wg.Wait()
 	return movieList
 }
 
@@ -788,61 +809,108 @@ func fetchTVData() []Series {
 
 	fmt.Println("Fetching season details for", len(grouped), "series...")
 	
-	seriesCount := 0
 	totalSeries := len(grouped)
+	var seriesCompleted int32
+	
+	// Process each series
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	
 	for _, series := range grouped {
-		seriesCount++
-		updateProgress(seriesCount, totalSeries, fmt.Sprintf("Processing %d/%d: %s", seriesCount, totalSeries, series.Name))
-		
-		fmt.Println("Processing series:", series.Name, "with", len(series.Seasons), "seasons")
-		for i := range series.Seasons {
-			fmt.Printf("  Fetching info for season %d (ID: %s)\n", series.Seasons[i].SeasonNumber, series.Seasons[i].SeasonId)
+		wg.Add(1)
+		go func(s *Series) {
+			defer wg.Done()
 			
-			seasonInfoBody, err := fetchAPI("season_info", series.Seasons[i].SeasonId)
-			if err != nil {
-				fmt.Println("    Error fetching season info:", err)
-				continue
-			}
-			var seasonInfo SeasonDetails
-			if err := json.Unmarshal(seasonInfoBody, &seasonInfo); err != nil {
-				fmt.Println("    Error unmarshaling season info:", err)
-				continue
-			}
-			series.Seasons[i].TotalCount = seasonInfo.ChildCount
-			fmt.Printf("    Season %d: %d episodes total\n", series.Seasons[i].SeasonNumber, seasonInfo.ChildCount)
+			fmt.Println("Processing series:", s.Name, "with", len(s.Seasons), "seasons")
 			
-			seasonEpisodesBody, err := fetchAPI("season_episodes", series.Seasons[i].SeasonId)
-			if err != nil {
-				fmt.Println("    Error fetching season episodes:", err)
-				continue
-			}
-			var seasonEpisodes EpisodeList
-			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
-				fmt.Println("    Error unmarshaling season episodes:", err)
-				continue
+			// Process seasons for this series
+			var seasonWg sync.WaitGroup
+			seasonSem := make(chan struct{}, 5) // Limit concurrent season fetches
+			
+			for i := range s.Seasons {
+				seasonWg.Add(1)
+				go func(idx int) {
+					defer seasonWg.Done()
+					seasonSem <- struct{}{}
+					defer func() { <-seasonSem }()
+					
+					fmt.Printf("  Fetching info for season %d (ID: %s)\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SeasonId)
+					
+					seasonInfoBody, err := fetchAPI("season_info", s.Seasons[idx].SeasonId)
+					if err != nil {
+						fmt.Println("    Error fetching season info:", err)
+						return
+					}
+					var seasonInfo SeasonDetails
+					if err := json.Unmarshal(seasonInfoBody, &seasonInfo); err != nil {
+						fmt.Println("    Error unmarshaling season info:", err)
+						return
+					}
+					s.Seasons[idx].TotalCount = seasonInfo.ChildCount
+					fmt.Printf("    Season %d: %d episodes total\n", s.Seasons[idx].SeasonNumber, seasonInfo.ChildCount)
+					
+					seasonEpisodesBody, err := fetchAPI("season_episodes", s.Seasons[idx].SeasonId)
+					if err != nil {
+						fmt.Println("    Error fetching season episodes:", err)
+						return
+					}
+					var seasonEpisodes EpisodeList
+					if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+						fmt.Println("    Error unmarshaling season episodes:", err)
+						return
+					}
+					
+					fmt.Printf("    Fetching sizes for %d episodes\n", len(seasonEpisodes.Items))
+					
+					// Parallelize episode size fetching
+					var epWg sync.WaitGroup
+					epSem := make(chan struct{}, 10) // Limit concurrent episode fetches
+					var sizeMu sync.Mutex
+					var totalSize int64
+					
+					for _, ep := range seasonEpisodes.Items {
+						epWg.Add(1)
+						go func(episode Episode) {
+							defer epWg.Done()
+							epSem <- struct{}{}
+							defer func() { <-epSem }()
+							
+							episodeDetailsBody, err := fetchAPI("episode_details", episode.Id)
+							if err != nil {
+								return
+							}
+							var details MovieDetails
+							if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+								return
+							}
+							if len(details.MediaSources) > 0 {
+								sizeMu.Lock()
+								totalSize += details.MediaSources[0].Size
+								sizeMu.Unlock()
+							}
+						}(ep)
+					}
+					
+					epWg.Wait()
+					s.Seasons[idx].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
+					
+					mu.Lock()
+					s.TotalSize += s.Seasons[idx].SizeGB
+					mu.Unlock()
+					
+					fmt.Printf("    Season %d: %.2f GB total\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SizeGB)
+				}(i)
 			}
 			
-			fmt.Printf("    Fetching sizes for %d episodes\n", len(seasonEpisodes.Items))
-			var totalSize int64
-			for _, ep := range seasonEpisodes.Items {
-				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
-				if err != nil {
-					continue
-				}
-				var details MovieDetails
-				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
-					continue
-				}
-				if len(details.MediaSources) > 0 {
-					totalSize += details.MediaSources[0].Size
-				}
-			}
-			series.Seasons[i].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
-			series.TotalSize += series.Seasons[i].SizeGB
-			fmt.Printf("    Season %d: %.2f GB total\n", series.Seasons[i].SeasonNumber, series.Seasons[i].SizeGB)
-		}
+			seasonWg.Wait()
+			
+			// Update progress after series completes
+			current := atomic.AddInt32(&seriesCompleted, 1)
+			updateProgress(int(current), totalSeries, fmt.Sprintf("Completed %d/%d series", int(current), totalSeries))
+		}(series)
 	}
+	
+	wg.Wait()
 
 	var seriesList []Series
 	for _, s := range grouped {
