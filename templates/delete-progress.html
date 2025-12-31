@@ -1,0 +1,41 @@
+<div class="modal-header">
+    <h2>Deleting...</h2>
+</div>
+
+<div class="status-message info">
+    <strong>Status:</strong> {{.Message}}
+</div>
+
+<div class="progress-bar">
+    <div class="progress-fill" style="width: {{.Percent}}%">
+        {{.Current}} / {{.Total}}
+    </div>
+</div>
+
+<div id="progressDetails">
+    {{if .CurrentItem}}
+    <div class="status-message">
+        Currently processing: <strong>{{.CurrentItem}}</strong>
+    </div>
+    {{end}}
+</div>
+
+<script>
+    (function pollProgress() {
+        setTimeout(function() {
+            fetch('/delete-progress')
+                .then(r => r.text())
+                .then(html => {
+                    document.getElementById('modalContent').innerHTML = html;
+                    // Continue polling if still deleting
+                    if (html.includes('Deleting...')) {
+                        pollProgress();
+                    }
+                })
+                .catch(err => {
+                    console.error('Error polling progress:', err);
+                });
+        }, 500);
+    })();
+</script>
+

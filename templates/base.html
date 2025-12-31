@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{block "title" .}}Watched Cleanup{{end}}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0; 
+            padding: 20px; 
+            background: #1a1a1a; 
+            color: #fff; 
+        }
+        .header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            margin-bottom: 20px; 
+        }
+        .refresh-btn { 
+            padding: 10px 20px; 
+            background: #4CAF50; 
+            color: white; 
+            border: none; 
+            border-radius: 4px; 
+            cursor: pointer; 
+            font-size: 16px;
+            transition: background 0.2s;
+        }
+        .refresh-btn:hover:not(:disabled) { background: #45a049; }
+        .refresh-btn:disabled { background: #666; cursor: not-allowed; }
+        .status { color: #aaa; font-size: 14px; }
+        h1 { margin: 0; }
+        
+        /* Modal styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.show {
+            display: flex;
+        }
+        .modal {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #444;
+            padding-bottom: 15px;
+        }
+        .modal-header h2 {
+            margin: 0;
+        }
+        .close-btn {
+            background: none;
+            border: none;
+            color: #fff;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            line-height: 30px;
+        }
+        .close-btn:hover {
+            color: #f44336;
+        }
+        .delete-preview-item {
+            padding: 10px;
+            margin: 10px 0;
+            background: #333;
+            border-radius: 4px;
+            border-left: 3px solid #4CAF50;
+        }
+        .delete-preview-item strong {
+            color: #4CAF50;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #4CAF50;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 12px;
+        }
+        .status-message {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background: #333;
+        }
+        .status-message.info {
+            background: #2196F3;
+        }
+        .status-message.success {
+            background: #4CAF50;
+        }
+        .status-message.error {
+            background: #f44336;
+        }
+        .summary-item {
+            padding: 10px;
+            margin: 5px 0;
+            background: #333;
+            border-radius: 4px;
+        }
+        .summary-item.success {
+            border-left: 3px solid #4CAF50;
+        }
+        .summary-item.error {
+            border-left: 3px solid #f44336;
+        }
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.2s;
+        }
+        .btn-primary {
+            background: #4CAF50;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #45a049;
+        }
+        .btn-danger {
+            background: #f44336;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #da190b;
+        }
+        .btn-secondary {
+            background: #666;
+            color: white;
+        }
+        .btn-secondary:hover {
+            background: #777;
+        }
+        .spinner {
+            border: 3px solid #333;
+            border-top: 3px solid #4CAF50;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    {{block "extra-styles" .}}{{end}}
+</head>
+<body>
+    {{block "content" .}}{{end}}
+    
+    <!-- Modal overlay -->
+    <div id="modalOverlay" class="modal-overlay" onclick="if(event.target === this) closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div id="modalContent">
+                <!-- Modal content will be loaded here via HTMX -->
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function openModal() {
+            document.getElementById('modalOverlay').classList.add('show');
+        }
+        
+        function closeModal() {
+            document.getElementById('modalOverlay').classList.remove('show');
+            document.getElementById('modalContent').innerHTML = '';
+        }
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeModal();
+            }
+        });
+        
+        // HTMX event handlers
+        document.body.addEventListener('htmx:afterSwap', function(evt) {
+            if (evt.detail.target.id === 'modalContent') {
+                openModal();
+            }
+        });
+        
+        // Global function for confirm delete - accessible from dynamically loaded content
+        window.confirmDeleteNow = function(type, ids) {
+            console.log('confirmDeleteNow called', { type, ids });
+            
+            if (!type || !ids) {
+                alert('Error: Missing required information');
+                return;
+            }
+            
+            const modalContent = document.getElementById('modalContent');
+            const btn = event.target;
+            
+            // Disable button
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+            
+            fetch('/delete-confirm?type=' + encodeURIComponent(type) + '&ids=' + encodeURIComponent(ids))
+                .then(r => {
+                    if (!r.ok) {
+                        throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+                    }
+                    return r.text();
+                })
+                .then(html => {
+                    modalContent.innerHTML = html;
+                    // Start polling for progress
+                    let pollCount = 0;
+                    const maxPolls = 600; // 5 minutes max
+                    const pollInterval = setInterval(function() {
+                        pollCount++;
+                        if (pollCount > maxPolls) {
+                            clearInterval(pollInterval);
+                            alert('Delete operation timed out');
+                            return;
+                        }
+                        
+                        fetch('/delete-progress')
+                            .then(r => r.text())
+                            .then(html => {
+                                modalContent.innerHTML = html;
+                                // Stop polling if we see the summary (not "Deleting...")
+                                if (!html.includes('Deleting...')) {
+                                    clearInterval(pollInterval);
+                                }
+                            })
+                            .catch(err => {
+                                console.error('Error polling progress:', err);
+                                clearInterval(pollInterval);
+                            });
+                    }, 500);
+                })
+                .catch(err => {
+                    console.error('Error confirming delete:', err);
+                    alert('Error starting deletion: ' + err.message);
+                    btn.disabled = false;
+                    btn.textContent = 'Confirm Delete';
+                });
+        };
+    </script>
+    {{block "extra-scripts" .}}{{end}}
+</body>
+</html>
+

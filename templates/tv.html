@@ -1,0 +1,217 @@
+{{define "title"}}Watched TV Shows{{end}}
+
+{{define "extra-styles"}}
+<style>
+    .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; }
+    .series { 
+        margin-bottom: 20px; 
+        border: 1px solid #333; 
+        padding: 15px; 
+        background: #2a2a2a;
+        border-radius: 4px;
+        display: flex;
+        gap: 15px;
+    }
+    .series-content { flex: 1; }
+    .season { 
+        margin-left: 20px; 
+        padding: 10px;
+        border-left: 3px solid #4CAF50;
+        margin-top: 10px;
+        display: flex;
+        align-items: center;
+        gap: 15px;
+    }
+    .season input[type="checkbox"] {
+        width: 20px;
+        height: 20px;
+        cursor: pointer;
+    }
+    img { max-width: 200px; height: auto; border-radius: 4px; }
+    .delete-btn {
+        padding: 12px 24px;
+        background: #f44336;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        transition: background 0.2s;
+    }
+    .delete-btn:hover:not(:disabled) {
+        background: #da190b;
+    }
+    .delete-btn:disabled { background: #666; cursor: not-allowed; }
+    select, input[type="number"] {
+        padding: 8px;
+        background: #333;
+        color: #fff;
+        border: 1px solid #555;
+        border-radius: 4px;
+        font-size: 14px;
+    }
+    label { color: #aaa; font-size: 14px; }
+    .select-all { margin-left: 10px; }
+</style>
+{{end}}
+
+{{define "content"}}
+<div class="header">
+    <div>
+        <h1>Watched TV Shows</h1>
+        <div class="status" id="status">
+            {{if .LastRefresh.IsZero}}
+                No data loaded. Click refresh to load.
+            {{else}}
+                Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
+            {{end}}
+        </div>
+    </div>
+    <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
+</div>
+
+{{if .Series}}
+<div class="controls">
+    <label>Sort by:</label>
+    <select id="sortBy" onchange="applyFilters()">
+        <option value="name">Name</option>
+        <option value="size-desc">Size (Largest First)</option>
+        <option value="size-asc">Size (Smallest First)</option>
+    </select>
+    
+    <label>Min Size (GB):</label>
+    <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
+    
+    <label>
+        <input type="checkbox" id="fullyWatched" onchange="applyFilters()">
+        Fully watched only
+    </label>
+    
+    <button class="select-all" onclick="selectAll()">Select All</button>
+    <button class="select-all" onclick="deselectAll()">Deselect All</button>
+</div>
+
+<button class="delete-btn" id="deleteSeasonsBtn">
+    Delete Selected Seasons
+</button>
+
+<div id="seriesList">
+{{range .Series}}
+<div class="series" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}">
+    {{if .ImageTags.Primary}}
+    <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
+    {{end}}
+    <div class="series-content">
+        <h2>{{.Name}} ({{printf "%.2f" .TotalSize}} GB total)</h2>
+        {{range .Seasons}}
+        <div class="season">
+            <input type="checkbox" name="season" value="{{.SeasonId}}">
+            <div>
+                <strong>Season {{.SeasonNumber}}:</strong> {{.WatchedCount}}/{{.TotalCount}} episodes watched ({{printf "%.2f" .SizeGB}} GB)
+            </div>
+        </div>
+        {{end}}
+    </div>
+</div>
+{{end}}
+</div>
+{{else}}
+<p style="color: #aaa;">No TV shows loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
+{{end}}
+
+<script>
+    function refreshData() {
+        const btn = document.getElementById('refreshBtn');
+        const status = document.getElementById('status');
+        btn.disabled = true;
+        btn.textContent = 'Refreshing...';
+        status.textContent = 'Starting refresh...';
+        
+        fetch('/refresh-tv', { method: 'POST' })
+            .then(r => r.text())
+            .then(() => {
+                checkRefreshStatus();
+            });
+    }
+    
+    function checkRefreshStatus() {
+        fetch('/refresh-status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.isRefreshing) {
+                    document.getElementById('status').textContent = data.message;
+                    setTimeout(checkRefreshStatus, 1000);
+                } else {
+                    location.reload();
+                }
+            });
+    }
+    
+    function applyFilters() {
+        const sortBy = document.getElementById('sortBy').value;
+        const minSize = parseFloat(document.getElementById('minSize').value) || 0;
+        const fullyWatched = document.getElementById('fullyWatched').checked;
+        
+        const container = document.getElementById('seriesList');
+        const series = Array.from(container.children);
+        
+        series.forEach(s => {
+            const size = parseFloat(s.dataset.size);
+            const isFullyWatched = s.dataset.fullyWatched === 'true';
+            
+            let show = size >= minSize;
+            if (fullyWatched && !isFullyWatched) show = false;
+            
+            s.style.display = show ? 'flex' : 'none';
+        });
+        
+        const visibleSeries = series.filter(s => s.style.display !== 'none');
+        
+        visibleSeries.sort((a, b) => {
+            if (sortBy === 'name') {
+                return a.dataset.name.localeCompare(b.dataset.name);
+            } else if (sortBy === 'size-desc') {
+                return parseFloat(b.dataset.size) - parseFloat(a.dataset.size);
+            } else if (sortBy === 'size-asc') {
+                return parseFloat(a.dataset.size) - parseFloat(b.dataset.size);
+            }
+            return 0;
+        });
+        
+        visibleSeries.forEach(s => container.appendChild(s));
+    }
+    
+    function selectAll() {
+        document.querySelectorAll('input[name="season"]').forEach(cb => {
+            if (cb.closest('.series').style.display !== 'none') {
+                cb.checked = true;
+            }
+        });
+    }
+    
+    function deselectAll() {
+        document.querySelectorAll('input[name="season"]:checked').forEach(cb => cb.checked = false);
+    }
+    
+    document.addEventListener('DOMContentLoaded', function() {
+        const deleteBtn = document.getElementById('deleteSeasonsBtn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', function() {
+                const checked = document.querySelectorAll('input[name="season"]:checked');
+                if (checked.length === 0) {
+                    alert('Please select at least one season');
+                    return;
+                }
+                const ids = Array.from(checked).map(cb => cb.value).join(',');
+                fetch('/delete-preview?type=season&ids=' + ids)
+                    .then(r => r.text())
+                    .then(html => {
+                        document.getElementById('modalContent').innerHTML = html;
+                        openModal();
+                    });
+            });
+        }
+    });
+</script>
+{{end}}
+

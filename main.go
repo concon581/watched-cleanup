@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -85,6 +87,24 @@ type RefreshProgress struct {
 	Message string
 }
 
+type DeleteProgress struct {
+	Current     int
+	Total       int
+	Message     string
+	CurrentItem string
+	Percent     int
+}
+
+type DeleteResult struct {
+	DeletedCount     int
+	DeletedHardlinks int
+	Errors           []string
+	Details          []struct {
+		Name string
+		Path string
+	}
+}
+
 var (
 	cachedMovies    MovieList
 	cachedSeries    []Series
@@ -93,406 +113,128 @@ var (
 	cacheMutex      sync.RWMutex
 	refreshProgress RefreshProgress
 	progressMutex   sync.RWMutex
+
+	// Delete progress tracking
+	deleteProgress DeleteProgress
+	deleteResult   DeleteResult
+	deleteMutex    sync.RWMutex
+	isDeleting     bool
 )
 
-var htmlTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watched Movies</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .refresh-btn { 
-            padding: 10px 20px; 
-            background: #4CAF50; 
-            color: white; 
-            border: none; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            font-size: 16px;
-        }
-        .refresh-btn:disabled { background: #666; cursor: not-allowed; }
-        .status { color: #aaa; font-size: 14px; }
-        .movie { 
-            margin-bottom: 20px; 
-            border: 1px solid #333; 
-            padding: 15px; 
-            background: #2a2a2a;
-            border-radius: 4px;
-            display: flex;
-            gap: 15px;
-        }
-        .movie-content { flex: 1; }
-        .movie-checkbox { 
-            display: flex; 
-            align-items: center; 
-        }
-        .movie-checkbox input { 
-            width: 20px; 
-            height: 20px; 
-            cursor: pointer; 
-        }
-        img { max-width: 200px; height: auto; border-radius: 4px; }
-        .delete-btn {
-            padding: 12px 24px;
-            background: #f44336;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-            margin-top: 20px;
-        }
-        .delete-btn:disabled { background: #666; cursor: not-allowed; }
-        h1 { margin: 0; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>Watched Movies</h1>
-            <div class="status" id="status">
-                {{if .LastRefresh.IsZero}}
-                    No data loaded. Click refresh to load.
-                {{else}}
-                    Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
-                {{end}}
-            </div>
-        </div>
-        <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
-    </div>
-    
-    {{if .Items}}
-    <button class="delete-btn" onclick="deleteSelected()">Delete Selected</button>
-    
-    {{range .Items}}
-    <div class="movie">
-        <div class="movie-checkbox">
-            <input type="checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}">
-        </div>
-        <div class="movie-content">
-            <h2>{{.Name}} {{if .ProductionYear}}({{.ProductionYear}}){{end}}</h2>
-            <p>{{.Overview}}</p>
-            <p><strong>Size:</strong> {{printf "%.2f" .SizeGB}} GB</p>
-            <p><strong>Path:</strong> {{.Path}}</p>
-        </div>
-        {{if .ImageTags.Primary}}
-        <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
-        {{end}}
-    </div>
-    {{end}}
-    {{else}}
-    <p style="color: #aaa;">No movies loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
-    {{end}}
-    
-    <script>
-        function refreshData() {
-            const btn = document.getElementById('refreshBtn');
-            const status = document.getElementById('status');
-            btn.disabled = true;
-            btn.textContent = 'Refreshing...';
-            status.textContent = 'Fetching data from Jellyfin...';
-            
-            fetch('/refresh', { method: 'POST' })
-                .then(r => r.text())
-                .then(() => {
-                    checkRefreshStatus();
-                });
-        }
-        
-        function checkRefreshStatus() {
-            fetch('/refresh-status')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.isRefreshing) {
-                        document.getElementById('status').textContent = data.message;
-                        setTimeout(checkRefreshStatus, 1000);
-                    } else {
-                        location.reload();
-                    }
-                });
-        }
-        
-        function deleteSelected() {
-            const checked = document.querySelectorAll('input[name="movie"]:checked');
-            if (checked.length === 0) {
-                alert('Please select at least one movie to delete');
-                return;
-            }
-            
-            if (!confirm('Delete ' + checked.length + ' movie(s)? This cannot be undone!')) {
-                return;
-            }
-            
-            const ids = Array.from(checked).map(cb => cb.value);
-            
-            fetch('/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: ids, type: 'movie' })
-            })
-            .then(r => r.text())
-            .then(msg => {
-                alert(msg);
-                location.reload();
-            });
-        }
-    </script>
-</body>
-</html>`
+// Load templates from files
+var tmpl *template.Template
+var tvTmpl *template.Template
+var deletePreviewTmpl *template.Template
+var deleteProgressTmpl *template.Template
+var deleteSummaryTmpl *template.Template
 
-var tmpl = template.Must(template.New("movies").Funcs(template.FuncMap{
-	"formatTime": func(t time.Time) string {
-		return t.Format("Jan 2, 2006 3:04 PM")
-	},
-}).Parse(htmlTemplate))
+func initTemplates() {
+	var err error
+	funcMap := template.FuncMap{
+		"formatTime": func(t time.Time) string {
+			return t.Format("Jan 2, 2006 3:04 PM")
+		},
+	}
 
-var tvTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watched TV Shows</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; }
-        .refresh-btn { 
-            padding: 10px 20px; 
-            background: #4CAF50; 
-            color: white; 
-            border: none; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            font-size: 16px;
-        }
-        .refresh-btn:disabled { background: #666; cursor: not-allowed; }
-        .status { color: #aaa; font-size: 14px; }
-        .series { 
-            margin-bottom: 20px; 
-            border: 1px solid #333; 
-            padding: 15px; 
-            background: #2a2a2a;
-            border-radius: 4px;
-            display: flex;
-            gap: 15px;
-        }
-        .series-content { flex: 1; }
-        .season { 
-            margin-left: 20px; 
-            padding: 10px;
-            border-left: 3px solid #4CAF50;
-            margin-top: 10px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        .season input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
-        }
-        img { max-width: 200px; height: auto; border-radius: 4px; }
-        .delete-btn {
-            padding: 12px 24px;
-            background: #f44336;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        .delete-btn:disabled { background: #666; cursor: not-allowed; }
-        h1 { margin: 0; }
-        select, input[type="number"] {
-            padding: 8px;
-            background: #333;
-            color: #fff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        label { color: #aaa; font-size: 14px; }
-        .select-all { margin-left: 10px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>Watched TV Shows</h1>
-            <div class="status" id="status">
-                {{if .LastRefresh.IsZero}}
-                    No data loaded. Click refresh to load.
-                {{else}}
-                    Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
-                {{end}}
-            </div>
-        </div>
-        <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
-    </div>
-    
-    {{if .Series}}
-    <div class="controls">
-        <label>Sort by:</label>
-        <select id="sortBy" onchange="applyFilters()">
-            <option value="name">Name</option>
-            <option value="size-desc">Size (Largest First)</option>
-            <option value="size-asc">Size (Smallest First)</option>
-        </select>
-        
-        <label>Min Size (GB):</label>
-        <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
-        
-        <label>
-            <input type="checkbox" id="fullyWatched" onchange="applyFilters()">
-            Fully watched only
-        </label>
-        
-        <button class="select-all" onclick="selectAll()">Select All</button>
-        <button class="select-all" onclick="deselectAll()">Deselect All</button>
-    </div>
-    
-    <button class="delete-btn" onclick="deleteSelected()">Delete Selected Seasons</button>
-    
-    <div id="seriesList">
-    {{range .Series}}
-    <div class="series" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}">
-        {{if .ImageTags.Primary}}
-        <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
-        {{end}}
-        <div class="series-content">
-            <h2>{{.Name}} ({{printf "%.2f" .TotalSize}} GB total)</h2>
-            {{range .Seasons}}
-            <div class="season">
-                <input type="checkbox" name="season" value="{{.SeasonId}}">
-                <div>
-                    <strong>Season {{.SeasonNumber}}:</strong> {{.WatchedCount}}/{{.TotalCount}} episodes watched ({{printf "%.2f" .SizeGB}} GB)
-                </div>
-            </div>
-            {{end}}
-        </div>
-    </div>
-    {{end}}
-    </div>
-    {{else}}
-    <p style="color: #aaa;">No TV shows loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
-    {{end}}
-    
-    <script>
-        function refreshData() {
-            const btn = document.getElementById('refreshBtn');
-            const status = document.getElementById('status');
-            btn.disabled = true;
-            btn.textContent = 'Refreshing...';
-            status.textContent = 'Starting refresh...';
-            
-            fetch('/refresh-tv', { method: 'POST' })
-                .then(r => r.text())
-                .then(() => {
-                    checkRefreshStatus();
-                });
-        }
-        
-        function checkRefreshStatus() {
-            fetch('/refresh-status')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.isRefreshing) {
-                        document.getElementById('status').textContent = data.message;
-                        setTimeout(checkRefreshStatus, 1000);
-                    } else {
-                        location.reload();
-                    }
-                });
-        }
-        
-        function applyFilters() {
-            const sortBy = document.getElementById('sortBy').value;
-            const minSize = parseFloat(document.getElementById('minSize').value) || 0;
-            const fullyWatched = document.getElementById('fullyWatched').checked;
-            
-            const container = document.getElementById('seriesList');
-            const series = Array.from(container.children);
-            
-            series.forEach(s => {
-                const size = parseFloat(s.dataset.size);
-                const isFullyWatched = s.dataset.fullyWatched === 'true';
-                
-                let show = size >= minSize;
-                if (fullyWatched && !isFullyWatched) show = false;
-                
-                s.style.display = show ? 'flex' : 'none';
-            });
-            
-            const visibleSeries = series.filter(s => s.style.display !== 'none');
-            
-            visibleSeries.sort((a, b) => {
-                if (sortBy === 'name') {
-                    return a.dataset.name.localeCompare(b.dataset.name);
-                } else if (sortBy === 'size-desc') {
-                    return parseFloat(b.dataset.size) - parseFloat(a.dataset.size);
-                } else if (sortBy === 'size-asc') {
-                    return parseFloat(a.dataset.size) - parseFloat(b.dataset.size);
-                }
-                return 0;
-            });
-            
-            visibleSeries.forEach(s => container.appendChild(s));
-        }
-        
-        function selectAll() {
-            document.querySelectorAll('input[name="season"]').forEach(cb => {
-                if (cb.closest('.series').style.display !== 'none') {
-                    cb.checked = true;
-                }
-            });
-        }
-        
-        function deselectAll() {
-            document.querySelectorAll('input[name="season"]:checked').forEach(cb => cb.checked = false);
-        }
-        
-        function deleteSelected() {
-            const checked = document.querySelectorAll('input[name="season"]:checked');
-            if (checked.length === 0) {
-                alert('Please select at least one season to delete');
-                return;
-            }
-            
-            if (!confirm('Delete ' + checked.length + ' season(s)? This cannot be undone!')) {
-                return;
-            }
-            
-            const ids = Array.from(checked).map(cb => cb.value);
-            
-            fetch('/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: ids, type: 'season' })
-            })
-            .then(r => r.text())
-            .then(msg => {
-                alert(msg);
-                location.reload();
-            });
-        }
-    </script>
-</body>
-</html>`
+	// Try to find templates relative to executable or current directory
+	templateDir := "templates"
+	if _, err := os.Stat(templateDir); os.IsNotExist(err) {
+		// Try relative to executable
+		exe, err := os.Executable()
+		if err == nil {
+			exeDir := filepath.Dir(exe)
+			possibleDir := filepath.Join(exeDir, "templates")
+			if _, err := os.Stat(possibleDir); err == nil {
+				templateDir = possibleDir
+			}
+		}
+	}
 
-var tvTmpl = template.Must(template.New("tv").Funcs(template.FuncMap{
-	"formatTime": func(t time.Time) string {
-		return t.Format("Jan 2, 2006 3:04 PM")
-	},
-}).Parse(tvTemplate))
+	tmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "movies.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading movies template: %v", err))
+	}
+
+	tvTmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "tv.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading TV template: %v", err))
+	}
+
+	deletePreviewTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-preview.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete preview template: %v", err))
+	}
+
+	deleteProgressTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-progress.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete progress template: %v", err))
+	}
+
+	deleteSummaryTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-summary.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete summary template: %v", err))
+	}
+}
+
+// loadEnvFile loads environment variables from .env file if it exists
+// This is for local development - Docker uses docker-compose.yml
+func loadEnvFile() {
+	envFile := ".env"
+	if _, err := os.Stat(envFile); os.IsNotExist(err) {
+		return // .env file doesn't exist, skip
+	}
+
+	file, err := os.Open(envFile)
+	if err != nil {
+		return // Can't open file, skip silently
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse KEY=VALUE format
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Remove quotes if present
+			value = strings.Trim(value, "\"'")
+
+			// Only set if not already set (allows override via actual env vars)
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+}
 
 func main() {
+	// Load .env file for local development (Docker uses docker-compose.yml)
+	loadEnvFile()
+
+	initTemplates()
+
 	http.HandleFunc("/", handleMovies)
 	http.HandleFunc("/tv", handleTV)
 	http.HandleFunc("/refresh", handleRefreshMovies)
 	http.HandleFunc("/refresh-tv", handleRefreshTV)
 	http.HandleFunc("/refresh-status", handleRefreshStatus)
-	http.HandleFunc("/delete", handleDelete)
+	http.HandleFunc("/delete-preview", handleDeletePreview)
+	http.HandleFunc("/delete-confirm", handleDeleteConfirm)
+	http.HandleFunc("/delete-progress", handleDeleteProgress)
+	http.HandleFunc("/delete", handleDelete) // Keep for backwards compatibility
 	fmt.Println("watched-cleanup v1.0.1 - hardlink test starting...")
 	fmt.Println("Server starting on :6969")
 	http.ListenAndServe(":6969", nil)
@@ -568,7 +310,10 @@ func handleMovies(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	tmpl.Execute(w, data)
+	if err := tmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
 }
 
 func handleTV(w http.ResponseWriter, r *http.Request) {
@@ -605,8 +350,9 @@ func handleTV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	if err := tvTmpl.Execute(w, data); err != nil {
-		fmt.Println("Template error:", err)
+	if err := tvTmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
 	}
 }
 
@@ -681,17 +427,444 @@ func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 		"total":        progress.Total,
 	})
 }
+
+func handleDeletePreview(w http.ResponseWriter, r *http.Request) {
+	deleteType := r.URL.Query().Get("type")
+	idsParam := r.URL.Query().Get("ids")
+
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids parameter", http.StatusBadRequest)
+		return
+	}
+
+	ids := []string{}
+	for _, id := range splitIDs(idsParam) {
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch preview items
+	previewItems := []struct {
+		Name   string
+		SizeGB float64
+		Path   string
+	}{}
+
+	cacheMutex.RLock()
+	if deleteType == "movie" {
+		for _, id := range ids {
+			for _, movie := range cachedMovies.Items {
+				if movie.Id == id {
+					previewItems = append(previewItems, struct {
+						Name   string
+						SizeGB float64
+						Path   string
+					}{
+						Name:   movie.Name,
+						SizeGB: movie.SizeGB,
+						Path:   movie.Path,
+					})
+					break
+				}
+			}
+		}
+	} else if deleteType == "season" {
+		for _, id := range ids {
+			for _, series := range cachedSeries {
+				for _, season := range series.Seasons {
+					if season.SeasonId == id {
+						previewItems = append(previewItems, struct {
+							Name   string
+							SizeGB float64
+							Path   string
+						}{
+							Name:   fmt.Sprintf("%s - Season %d", series.Name, season.SeasonNumber),
+							SizeGB: season.SizeGB,
+							Path:   fmt.Sprintf("Season %d", season.SeasonNumber),
+						})
+						break
+					}
+				}
+			}
+		}
+	}
+	cacheMutex.RUnlock()
+
+	data := struct {
+		Type  string
+		Ids   string
+		Items []struct {
+			Name   string
+			SizeGB float64
+			Path   string
+		}
+	}{
+		Type:  deleteType,
+		Ids:   idsParam,
+		Items: previewItems,
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := deletePreviewTmpl.Execute(w, data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
+}
+
+func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
+	var deleteType, idsParam string
+
+	// Support both GET (query params) and POST (form/JSON)
+	if r.Method == "POST" {
+		if r.Header.Get("Content-Type") == "application/json" {
+			var req struct {
+				Type string `json:"type"`
+				Ids  string `json:"ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+				deleteType = req.Type
+				idsParam = req.Ids
+			}
+		} else {
+			// Form data
+			deleteType = r.FormValue("type")
+			idsParam = r.FormValue("ids")
+		}
+	} else {
+		// GET request
+		deleteType = r.URL.Query().Get("type")
+		idsParam = r.URL.Query().Get("ids")
+	}
+
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids", http.StatusBadRequest)
+		return
+	}
+
+	ids := splitIDs(idsParam)
+
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Start delete operation in background
+	deleteMutex.Lock()
+	if isDeleting {
+		deleteMutex.Unlock()
+		http.Error(w, "Delete already in progress", http.StatusConflict)
+		return
+	}
+	isDeleting = true
+	deleteProgress = DeleteProgress{
+		Total:   len(ids),
+		Current: 0,
+		Message: "Starting deletion...",
+		Percent: 0,
+	}
+	deleteResult = DeleteResult{
+		Details: []struct {
+			Name string
+			Path string
+		}{},
+		Errors: []string{},
+	}
+	deleteMutex.Unlock()
+
+	// Show progress modal immediately
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, deleteProgress)
+
+	// Start deletion in background
+	go performDelete(ids, deleteType)
+}
+
+func handleDeleteProgress(w http.ResponseWriter, r *http.Request) {
+	deleteMutex.RLock()
+	progress := deleteProgress
+	deleting := isDeleting
+	deleteMutex.RUnlock()
+
+	if !deleting {
+		// Deletion complete, show summary
+		deleteMutex.RLock()
+		result := deleteResult
+		deleteMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		deleteSummaryTmpl.Execute(w, result)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, progress)
+}
+
+func splitIDs(idsParam string) []string {
+	ids := []string{}
+	for _, id := range strings.Split(idsParam, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func updateDeleteProgress(current, total int, message, currentItem string) {
+	deleteMutex.Lock()
+	deleteProgress = DeleteProgress{
+		Current:     current,
+		Total:       total,
+		Message:     message,
+		CurrentItem: currentItem,
+		Percent:     int(float64(current) / float64(total) * 100),
+	}
+	deleteMutex.Unlock()
+}
+
+func performDelete(ids []string, deleteType string) {
+	fmt.Printf("watched-cleanup: Starting deletion of %d %s(s)\n", len(ids), deleteType)
+
+	defer func() {
+		deleteMutex.Lock()
+		isDeleting = false
+		deleteMutex.Unlock()
+		fmt.Printf("watched-cleanup: Deletion process completed\n")
+	}()
+
+	var deletedHardlinks []string
+	var errors []string
+	var details []struct {
+		Name string
+		Path string
+	}
+
+	// Get hardlink search directory from env, default to /data/torrents for Docker
+	hardlinkSearchDir := os.Getenv("HARDLINK_SEARCH_DIR")
+	if hardlinkSearchDir == "" {
+		hardlinkSearchDir = "/data/torrents"
+	}
+	fmt.Printf("watched-cleanup: Using hardlink search directory: %s\n", hardlinkSearchDir)
+
+	for i, id := range ids {
+		var filesToCheck []string
+		var itemName string
+
+		// Handle different types differently
+		if deleteType == "season" {
+			fmt.Printf("watched-cleanup: Processing season %d/%d (ID: %s)\n", i+1, len(ids), id)
+			updateDeleteProgress(i+1, len(ids), fmt.Sprintf("Processing season %d of %d", i+1, len(ids)), "")
+
+			seasonEpisodesBody, err := fetchAPI("season_episodes", id)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error fetching season episodes: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				errors = append(errors, errMsg)
+				continue
+			}
+
+			var seasonEpisodes EpisodeList
+			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+				errMsg := fmt.Sprintf("Error parsing season episodes: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				errors = append(errors, errMsg)
+				continue
+			}
+
+			fmt.Printf("watched-cleanup: Found %d episodes in season\n", len(seasonEpisodes.Items))
+
+			// Get season name
+			cacheMutex.RLock()
+			for _, series := range cachedSeries {
+				for _, season := range series.Seasons {
+					if season.SeasonId == id {
+						itemName = fmt.Sprintf("%s - Season %d", series.Name, season.SeasonNumber)
+						break
+					}
+				}
+			}
+			cacheMutex.RUnlock()
+			fmt.Printf("watched-cleanup: Season name: %s\n", itemName)
+
+			for _, ep := range seasonEpisodes.Items {
+				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
+				if err != nil {
+					fmt.Printf("watched-cleanup: Error fetching episode %s: %v\n", ep.Id, err)
+					continue
+				}
+				var details MovieDetails
+				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+					fmt.Printf("watched-cleanup: Error parsing episode %s: %v\n", ep.Id, err)
+					continue
+				}
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("watched-cleanup: Episode file: %s\n", filepath.Base(path))
+					}
+				}
+			}
+		} else if deleteType == "movie" {
+			fmt.Printf("watched-cleanup: Processing movie %d/%d (ID: %s)\n", i+1, len(ids), id)
+			updateDeleteProgress(i+1, len(ids), fmt.Sprintf("Processing movie %d of %d", i+1, len(ids)), "")
+
+			detailsBody, err := fetchAPI("movie_details", id)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error fetching movie details: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				errors = append(errors, errMsg)
+				continue
+			}
+
+			var details MovieDetails
+			if err := json.Unmarshal(detailsBody, &details); err != nil {
+				errMsg := fmt.Sprintf("Error parsing movie details: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				errors = append(errors, errMsg)
+				continue
+			}
+
+			if len(details.MediaSources) > 0 {
+				path := details.MediaSources[0].Path
+				if path != "" {
+					filesToCheck = append(filesToCheck, path)
+					fmt.Printf("watched-cleanup: Movie file: %s\n", path)
+				}
+
+				// Get movie name
+				cacheMutex.RLock()
+				for _, movie := range cachedMovies.Items {
+					if movie.Id == id {
+						itemName = movie.Name
+						break
+					}
+				}
+				cacheMutex.RUnlock()
+				fmt.Printf("watched-cleanup: Movie name: %s\n", itemName)
+			}
+		}
+
+		// Find and delete hardlinks
+		if len(filesToCheck) > 0 {
+			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
+			for _, filePath := range filesToCheck {
+				updateDeleteProgress(i+1, len(ids), fmt.Sprintf("Deleting files for %s", itemName), filepath.Base(filePath))
+				fmt.Printf("watched-cleanup: Processing file: %s\n", filePath)
+
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					fmt.Printf("watched-cleanup: File doesn't exist (already deleted?): %s\n", filePath)
+					continue
+				}
+
+				// Check if hardlink search directory exists
+				if _, err := os.Stat(hardlinkSearchDir); os.IsNotExist(err) {
+					fmt.Printf("watched-cleanup: Hardlink search directory doesn't exist, skipping hardlink check: %s\n", hardlinkSearchDir)
+				} else {
+					hardlinks, err := findHardlinks(filePath, hardlinkSearchDir)
+					if err != nil {
+						errMsg := fmt.Sprintf("Error finding hardlinks for %s: %v", filePath, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						errors = append(errors, errMsg)
+					} else {
+						if len(hardlinks) > 0 {
+							fmt.Printf("watched-cleanup: Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
+							for _, link := range hardlinks {
+								fmt.Printf("watched-cleanup: Deleting hardlink: %s\n", link)
+								if err := os.Remove(link); err != nil {
+									errMsg := fmt.Sprintf("Error deleting hardlink %s: %v", link, err)
+									fmt.Printf("watched-cleanup: %s\n", errMsg)
+									errors = append(errors, errMsg)
+								} else {
+									deletedHardlinks = append(deletedHardlinks, link)
+									fmt.Printf("watched-cleanup: Successfully deleted hardlink: %s\n", link)
+								}
+							}
+						} else {
+							fmt.Printf("watched-cleanup: No hardlinks found for %s\n", filepath.Base(filePath))
+						}
+					}
+				}
+
+				// Delete the original file
+				fmt.Printf("watched-cleanup: Deleting original file: %s\n", filePath)
+				if err := os.Remove(filePath); err != nil {
+					errMsg := fmt.Sprintf("Error deleting %s: %v", filePath, err)
+					fmt.Printf("watched-cleanup: %s\n", errMsg)
+					errors = append(errors, errMsg)
+				} else {
+					fmt.Printf("watched-cleanup: Successfully deleted file: %s\n", filePath)
+				}
+			}
+		} else {
+			fmt.Printf("watched-cleanup: No files to delete for %s\n", itemName)
+		}
+
+		// Delete from Jellyfin
+		fmt.Printf("watched-cleanup: Deleting from Jellyfin database: %s (%s)\n", id, itemName)
+		updateDeleteProgress(i+1, len(ids), fmt.Sprintf("Removing from Jellyfin: %s", itemName), "")
+		callJellyfinDelete(id)
+		fmt.Printf("watched-cleanup: Jellyfin delete request sent for: %s\n", id)
+
+		details = append(details, struct {
+			Name string
+			Path string
+		}{
+			Name: itemName,
+			Path: "",
+		})
+	}
+
+	// Update final result
+	fmt.Printf("watched-cleanup: Deletion summary:\n")
+	fmt.Printf("watched-cleanup:   - Items deleted: %d\n", len(ids))
+	fmt.Printf("watched-cleanup:   - Hardlinks deleted: %d\n", len(deletedHardlinks))
+	fmt.Printf("watched-cleanup:   - Errors: %d\n", len(errors))
+	if len(errors) > 0 {
+		for _, err := range errors {
+			fmt.Printf("watched-cleanup:     * %s\n", err)
+		}
+	}
+
+	deleteMutex.Lock()
+	deleteResult = DeleteResult{
+		DeletedCount:     len(ids),
+		DeletedHardlinks: len(deletedHardlinks),
+		Errors:           errors,
+		Details:          details,
+	}
+	deleteMutex.Unlock()
+}
 func callJellyfinDelete(id string) {
 	baseurl := os.Getenv("JELLYFIN_BASE_URL")
 	token := os.Getenv("JELLYFIN_API_KEY")
 	url := fmt.Sprintf("%sItems/%s", baseurl, id)
 
-	req, _ := http.NewRequest("DELETE", url, nil)
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		fmt.Printf("watched-cleanup: Error creating Jellyfin delete request: %v\n", err)
+		return
+	}
 	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
 
 	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if err != nil {
+		fmt.Printf("watched-cleanup: Error sending Jellyfin delete request: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Printf("watched-cleanup: Jellyfin delete successful (HTTP %d)\n", resp.StatusCode)
+	} else {
+		fmt.Printf("watched-cleanup: Jellyfin delete returned HTTP %d\n", resp.StatusCode)
 	}
 }
 

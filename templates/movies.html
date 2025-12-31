@@ -1,0 +1,132 @@
+{{define "title"}}Watched Movies{{end}}
+
+{{define "extra-styles"}}
+<style>
+    .movie { 
+        margin-bottom: 20px; 
+        border: 1px solid #333; 
+        padding: 15px; 
+        background: #2a2a2a;
+        border-radius: 4px;
+        display: flex;
+        gap: 15px;
+    }
+    .movie-content { flex: 1; }
+    .movie-checkbox { 
+        display: flex; 
+        align-items: center; 
+    }
+    .movie-checkbox input { 
+        width: 20px; 
+        height: 20px; 
+        cursor: pointer; 
+    }
+    img { max-width: 200px; height: auto; border-radius: 4px; }
+    .delete-btn {
+        padding: 12px 24px;
+        background: #f44336;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        margin-top: 20px;
+        transition: background 0.2s;
+    }
+    .delete-btn:hover:not(:disabled) {
+        background: #da190b;
+    }
+    .delete-btn:disabled { background: #666; cursor: not-allowed; }
+</style>
+{{end}}
+
+{{define "content"}}
+<div class="header">
+    <div>
+        <h1>Watched Movies</h1>
+        <div class="status" id="status">
+            {{if .LastRefresh.IsZero}}
+                No data loaded. Click refresh to load.
+            {{else}}
+                Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
+            {{end}}
+        </div>
+    </div>
+    <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
+</div>
+
+{{if .Items}}
+<button class="delete-btn" id="deleteMoviesBtn">
+    Delete Selected
+</button>
+
+{{range .Items}}
+<div class="movie">
+    <div class="movie-checkbox">
+        <input type="checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}">
+    </div>
+    <div class="movie-content">
+        <h2>{{.Name}} {{if .ProductionYear}}({{.ProductionYear}}){{end}}</h2>
+        <p>{{.Overview}}</p>
+        <p><strong>Size:</strong> {{printf "%.2f" .SizeGB}} GB</p>
+        <p><strong>Path:</strong> {{.Path}}</p>
+    </div>
+    {{if .ImageTags.Primary}}
+    <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
+    {{end}}
+</div>
+{{end}}
+{{else}}
+<p style="color: #aaa;">No movies loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
+{{end}}
+
+<script>
+    function refreshData() {
+        const btn = document.getElementById('refreshBtn');
+        const status = document.getElementById('status');
+        btn.disabled = true;
+        btn.textContent = 'Refreshing...';
+        status.textContent = 'Fetching data from Jellyfin...';
+        
+        fetch('/refresh', { method: 'POST' })
+            .then(r => r.text())
+            .then(() => {
+                checkRefreshStatus();
+            });
+    }
+    
+    function checkRefreshStatus() {
+        fetch('/refresh-status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.isRefreshing) {
+                    document.getElementById('status').textContent = data.message;
+                    setTimeout(checkRefreshStatus, 1000);
+                } else {
+                    location.reload();
+                }
+            });
+    }
+    
+    document.addEventListener('DOMContentLoaded', function() {
+        const deleteBtn = document.getElementById('deleteMoviesBtn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', function() {
+                const checked = document.querySelectorAll('input[name="movie"]:checked');
+                if (checked.length === 0) {
+                    alert('Please select at least one movie');
+                    return;
+                }
+                const ids = Array.from(checked).map(cb => cb.value).join(',');
+                fetch('/delete-preview?type=movie&ids=' + ids)
+                    .then(r => r.text())
+                    .then(html => {
+                        document.getElementById('modalContent').innerHTML = html;
+                        openModal();
+                    });
+            });
+        }
+    });
+</script>
+{{end}}
+

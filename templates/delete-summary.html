@@ -1,0 +1,39 @@
+<div class="modal-header">
+    <h2>Delete Complete</h2>
+    <button class="close-btn" onclick="closeModal(); location.reload();">&times;</button>
+</div>
+
+<div class="status-message success">
+    <strong>Successfully deleted {{.DeletedCount}} item(s)</strong>
+</div>
+
+{{if .DeletedHardlinks}}
+<div class="status-message info">
+    Also deleted {{.DeletedHardlinks}} hardlinked torrent file(s)
+</div>
+{{end}}
+
+{{if .Errors}}
+<div class="status-message error">
+    <strong>Errors encountered:</strong>
+    {{range .Errors}}
+    <div class="summary-item error">{{.}}</div>
+    {{end}}
+</div>
+{{end}}
+
+{{if .Details}}
+<div style="margin-top: 20px;">
+    <strong>Details:</strong>
+    {{range .Details}}
+    <div class="summary-item success">
+        <strong>{{.Name}}</strong> - Deleted successfully
+    </div>
+    {{end}}
+</div>
+{{end}}
+
+<div class="modal-actions">
+    <button class="btn btn-primary" onclick="closeModal(); location.reload();">Close</button>
+</div>
+
