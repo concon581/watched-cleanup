@@ -2,48 +2,276 @@
 
 {{define "extra-styles"}}
 <style>
-    .movie { 
-        margin-bottom: 20px; 
-        border: 1px solid #333; 
-        padding: 15px; 
-        background: #2a2a2a;
-        border-radius: 4px;
+    .controls-bar {
         display: flex;
-        gap: 15px;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 24px;
+        padding: 20px;
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        border: 1px solid var(--border-color);
+        flex-wrap: wrap;
+        gap: 16px;
     }
-    .movie-content { flex: 1; }
-    .movie-checkbox { 
-        display: flex; 
-        align-items: center; 
+
+    .controls-left {
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        flex-wrap: wrap;
     }
-    .movie-checkbox input { 
-        width: 20px; 
-        height: 20px; 
-        cursor: pointer; 
+
+    .controls-right {
+        display: flex;
+        gap: 12px;
+        align-items: center;
     }
-    img { max-width: 200px; height: auto; border-radius: 4px; }
+
     .delete-btn {
-        padding: 12px 24px;
-        background: #f44336;
+        padding: 12px 28px;
+        background: var(--accent-danger);
         color: white;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-sm);
         cursor: pointer;
-        font-size: 16px;
-        margin-top: 20px;
-        transition: background 0.2s;
+        font-size: 15px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        box-shadow: var(--shadow-sm);
     }
+
     .delete-btn:hover:not(:disabled) {
-        background: #da190b;
+        background: var(--accent-danger-hover);
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-md);
     }
-    .delete-btn:disabled { background: #666; cursor: not-allowed; }
+
+    .delete-btn:disabled {
+        background: var(--bg-tertiary);
+        cursor: not-allowed;
+        opacity: 0.6;
+    }
+
+    .select-btn {
+        padding: 10px 20px;
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+        transition: all 0.2s ease;
+    }
+
+    .select-btn:hover {
+        background: var(--bg-hover);
+        border-color: var(--accent-primary);
+    }
+
+    select, input[type="number"] {
+        padding: 10px 14px;
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        font-size: 14px;
+        font-family: inherit;
+        transition: all 0.2s ease;
+    }
+
+    select:hover, input[type="number"]:hover {
+        border-color: var(--accent-primary);
+    }
+
+    select:focus, input[type="number"]:focus {
+        outline: none;
+        border-color: var(--accent-primary);
+        box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+    }
+
+    label {
+        color: var(--text-secondary);
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .movies-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+        gap: 24px;
+    }
+
+    .movie-card {
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        overflow: hidden;
+        box-shadow: var(--shadow-md);
+        border: 1px solid var(--border-color);
+        transition: all 0.3s ease;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .movie-card:hover {
+        transform: translateY(-4px);
+        box-shadow: var(--shadow-lg);
+        border-color: var(--accent-primary);
+    }
+
+    .movie-card-header {
+        display: flex;
+        gap: 16px;
+        padding: 20px;
+    }
+
+    .movie-poster {
+        width: 120px;
+        height: 180px;
+        object-fit: cover;
+        border-radius: var(--radius-sm);
+        box-shadow: var(--shadow-sm);
+        flex-shrink: 0;
+    }
+
+    .movie-poster-placeholder {
+        width: 120px;
+        height: 180px;
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-muted);
+        font-size: 12px;
+        flex-shrink: 0;
+    }
+
+    .movie-info {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .movie-title {
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0;
+        color: var(--text-primary);
+        line-height: 1.3;
+    }
+
+    .movie-year {
+        color: var(--text-muted);
+        font-weight: 400;
+    }
+
+    .movie-overview {
+        font-size: 13px;
+        color: var(--text-secondary);
+        line-height: 1.5;
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        margin-top: 8px;
+    }
+
+    .movie-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: auto;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-color);
+    }
+
+    .movie-meta-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--text-secondary);
+    }
+
+    .movie-meta-item strong {
+        color: var(--accent-primary);
+        font-weight: 600;
+        min-width: 50px;
+    }
+
+    .movie-checkbox-container {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        z-index: 10;
+    }
+
+    .movie-checkbox {
+        width: 24px;
+        height: 24px;
+        cursor: pointer;
+        accent-color: var(--accent-primary);
+    }
+
+    .movie-card {
+        position: relative;
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: var(--text-secondary);
+    }
+
+    .empty-state-icon {
+        font-size: 64px;
+        margin-bottom: 16px;
+        opacity: 0.5;
+    }
+
+    .stats-bar {
+        display: flex;
+        gap: 16px;
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+    }
+
+    .stat-card {
+        flex: 1;
+        min-width: 200px;
+        padding: 20px;
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        border: 1px solid var(--border-color);
+    }
+
+    .stat-label {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-bottom: 8px;
+        text-transform: uppercase;
+            letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+        font-size: 28px;
+        font-weight: 700;
+        color: var(--accent-primary);
+    }
 </style>
 {{end}}
 
 {{define "content"}}
 <div class="header">
-    <div>
-        <h1>Watched Movies</h1>
+    <div class="header-content">
+        <h1>🎬 Watched Movies</h1>
         <div class="status" id="status">
             {{if .LastRefresh.IsZero}}
                 No data loaded. Click refresh to load.
@@ -52,32 +280,95 @@
             {{end}}
         </div>
     </div>
-    <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
+    <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">🔄 Refresh Data</button>
 </div>
 
 {{if .Items}}
-<button class="delete-btn" id="deleteMoviesBtn">
-    Delete Selected
-</button>
+{{$totalSize := 0.0}}
+{{range .Items}}{{$totalSize = add $totalSize .SizeGB}}{{end}}
 
+<div class="stats-bar">
+    <div class="stat-card">
+        <div class="stat-label">Total Movies</div>
+        <div class="stat-value">{{len .Items}}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Total Size</div>
+        <div class="stat-value">{{printf "%.1f" $totalSize}} GB</div>
+    </div>
+</div>
+
+<div class="controls-bar">
+    <div class="controls-left">
+        <label>Sort by:
+            <select id="sortBy" onchange="applyFilters()">
+                <option value="name">Name</option>
+                <option value="size-desc">Size (Largest First)</option>
+                <option value="size-asc">Size (Smallest First)</option>
+                <option value="date-desc">Recently Added</option>
+                <option value="date-asc">Oldest Added</option>
+            </select>
+        </label>
+
+        <label>Min Size (GB):
+            <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
+        </label>
+    </div>
+    <div class="controls-right">
+        <button class="select-btn" onclick="selectAll()">✓ Select All</button>
+        <button class="select-btn" onclick="deselectAll()">✗ Deselect All</button>
+        <span style="color: var(--text-secondary); font-size: 14px;">
+            <span id="selectedCount">0</span> selected
+        </span>
+        <button class="delete-btn" id="deleteMoviesBtn" disabled>
+            🗑️ Delete Selected
+        </button>
+    </div>
+</div>
+
+<div id="moviesList" class="movies-grid">
 {{range .Items}}
-<div class="movie">
-    <div class="movie-checkbox">
-        <input type="checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}">
+<div class="movie-card" data-size="{{.SizeGB}}" data-name="{{.Name}}" data-date="{{if not .DateAdded.IsZero}}{{.DateAdded.Unix}}{{else}}0{{end}}">
+    <div class="movie-checkbox-container">
+        <input type="checkbox" class="movie-checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}" onchange="updateSelectionCount()">
     </div>
-    <div class="movie-content">
-        <h2>{{.Name}} {{if .ProductionYear}}({{.ProductionYear}}){{end}}</h2>
-        <p>{{.Overview}}</p>
-        <p><strong>Size:</strong> {{printf "%.2f" .SizeGB}} GB</p>
-        <p><strong>Path:</strong> {{.Path}}</p>
+    <div class="movie-card-header">
+        {{if .ImageTags.Primary}}
+        <img src="{{$.JellyfinBaseURL}}Items/{{.Id}}/Images/Primary?maxWidth=240" alt="{{.Name}}" class="movie-poster">
+        {{else}}
+        <div class="movie-poster-placeholder">No Image</div>
+        {{end}}
+        <div class="movie-info">
+            <h2 class="movie-title">
+                {{.Name}}
+                {{if .ProductionYear}}<span class="movie-year">({{.ProductionYear}})</span>{{end}}
+            </h2>
+            {{if .Overview}}
+            <p class="movie-overview">{{.Overview}}</p>
+            {{end}}
+            <div class="movie-meta">
+                <div class="movie-meta-item">
+                    <strong>Size:</strong>
+                    <span>{{printf "%.2f" .SizeGB}} GB</span>
+                </div>
+                {{if not .DateAdded.IsZero}}
+                <div class="movie-meta-item">
+                    <strong>Added:</strong>
+                    <span>{{.DateAdded.Format "Jan 2, 2006"}} ({{daysAgo .DateAdded}} days ago)</span>
+                </div>
+                {{end}}
+            </div>
+        </div>
     </div>
-    {{if .ImageTags.Primary}}
-    <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
-    {{end}}
 </div>
 {{end}}
+</div>
 {{else}}
-<p style="color: #aaa;">No movies loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
+<div class="empty-state">
+    <div class="empty-state-icon">🎬</div>
+    <p style="font-size: 18px; margin-bottom: 8px;">No movies loaded</p>
+    <p style="color: var(--text-muted);">Click "Refresh Data" to fetch from Jellyfin.</p>
+</div>
 {{end}}
 
 <script>
@@ -85,7 +376,7 @@
         const btn = document.getElementById('refreshBtn');
         const status = document.getElementById('status');
         btn.disabled = true;
-        btn.textContent = 'Refreshing...';
+        btn.textContent = '⏳ Refreshing...';
         status.textContent = 'Fetching data from Jellyfin...';
         
         fetch('/refresh', { method: 'POST' })
@@ -107,7 +398,66 @@
                 }
             });
     }
-    
+
+    function applyFilters() {
+        const sortBy = document.getElementById('sortBy').value;
+        const minSize = parseFloat(document.getElementById('minSize').value) || 0;
+
+        const container = document.getElementById('moviesList');
+        const movies = Array.from(container.children);
+
+        movies.forEach(m => {
+            const size = parseFloat(m.dataset.size);
+            const show = size >= minSize;
+            m.style.display = show ? 'block' : 'none';
+        });
+
+        const visibleMovies = movies.filter(m => m.style.display !== 'none');
+
+        visibleMovies.sort((a, b) => {
+            if (sortBy === 'name') {
+                return a.dataset.name.localeCompare(b.dataset.name);
+            } else if (sortBy === 'size-desc') {
+                return parseFloat(b.dataset.size) - parseFloat(a.dataset.size);
+            } else if (sortBy === 'size-asc') {
+                return parseFloat(a.dataset.size) - parseFloat(b.dataset.size);
+            } else if (sortBy === 'date-desc') {
+                return parseInt(b.dataset.date) - parseInt(a.dataset.date);
+            } else if (sortBy === 'date-asc') {
+                return parseInt(a.dataset.date) - parseInt(b.dataset.date);
+            }
+            return 0;
+        });
+
+        visibleMovies.forEach(m => container.appendChild(m));
+        updateSelectionCount();
+    }
+
+    function updateSelectionCount() {
+        const checked = document.querySelectorAll('input[name="movie"]:checked');
+        const count = checked.length;
+        document.getElementById('selectedCount').textContent = count;
+        document.getElementById('deleteMoviesBtn').disabled = count === 0;
+    }
+
+    function selectAll() {
+        // Only select visible movies (respecting filters)
+        document.querySelectorAll('input[name="movie"]').forEach(cb => {
+            const movieCard = cb.closest('.movie-card');
+            if (movieCard && movieCard.style.display !== 'none') {
+                cb.checked = true;
+            }
+        });
+        updateSelectionCount();
+    }
+
+    function deselectAll() {
+        document.querySelectorAll('input[name="movie"]:checked').forEach(cb => {
+            cb.checked = false;
+        });
+        updateSelectionCount();
+    }
+
     document.addEventListener('DOMContentLoaded', function() {
         const deleteBtn = document.getElementById('deleteMoviesBtn');
         if (deleteBtn) {
@@ -126,7 +476,7 @@
                     });
             });
         }
+        updateSelectionCount();
     });
 </script>
 {{end}}
-

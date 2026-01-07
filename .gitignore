@@ -1,3 +1,30 @@
-notes.txt
-dockercompose.yml
+# Environment and config
 .env
+notes.txt
+
+# Docker compose (keep the hyphenated one)
+dockercompose.yml
+
+# Build artifacts
+watched-cleanup
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
