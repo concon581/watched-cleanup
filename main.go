@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -8,546 +9,184 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
 	"sync"
-	"sync/atomic"
-	"syscall"
 	"time"
+
+	"github.com/concon581/watched-cleanup/deletion"
+	"github.com/concon581/watched-cleanup/filesystem"
+	"github.com/concon581/watched-cleanup/jellyfin"
+	"github.com/concon581/watched-cleanup/models"
+	"github.com/concon581/watched-cleanup/radarr"
+	"github.com/concon581/watched-cleanup/sonarr"
 )
 
-type Movie struct {
-	Id             string            `json:"Id"`
-	Name           string            `json:"Name"`
-	Overview       string            `json:"Overview"`
-	ProductionYear int               `json:"ProductionYear"`
-	ImageTags      map[string]string `json:"ImageTags"`
-	Size           int64             `json:"Size"`
-	SizeGB         float64           `json:"-"`
-	Path           string            `json:"-"`
-}
-
-type MediaSource struct {
-	Size int64  `json:"Size"`
-	Path string `json:"Path"`
-}
-
-type MovieDetails struct {
-	MediaSources []MediaSource `json:"MediaSources"`
-}
-
-type MovieList struct {
-	Items []Movie `json:"Items"`
-}
-
-type Episode struct {
-	Id                string `json:"Id"`
-	Name              string `json:"Name"`
-	SeriesId          string `json:"SeriesId"`
-	SeriesName        string `json:"SeriesName"`
-	SeasonId          string `json:"SeasonId"`
-	ParentIndexNumber int    `json:"ParentIndexNumber"`
-	IndexNumber       int    `json:"IndexNumber"`
-}
-
-type SeasonDetails struct {
-	Id         string `json:"Id"`
-	Name       string `json:"Name"`
-	ChildCount int    `json:"ChildCount"`
-}
-
-type EpisodeList struct {
-	Items []Episode `json:"Items"`
-}
-
-type SeasonList struct {
-	Items []SeasonDetails `json:"Items"`
-}
-
-type SeasonInfo struct {
-	SeasonNumber int
-	SeasonId     string
-	WatchedCount int
-	TotalCount   int
-	SizeGB       float64
-}
-
-type Series struct {
-	Name      string
-	Id        string
-	ImageTags map[string]string `json:"ImageTags"`
-	Seasons   []SeasonInfo
-	TotalSize float64
-}
-
-type RefreshProgress struct {
-	Current int
-	Total   int
-	Message string
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
 }
 
 var (
-	cachedMovies    MovieList
-	cachedSeries    []Series
+	cachedMovies    models.MovieList
+	cachedSeries    []models.Series
 	isRefreshing    bool
 	lastRefresh     time.Time
 	cacheMutex      sync.RWMutex
-	refreshProgress RefreshProgress
+	refreshProgress models.RefreshProgress
 	progressMutex   sync.RWMutex
+
+	// Delete progress tracking
+	deleteProgress models.DeleteProgress
+	deleteResult   models.DeleteResult
+	deleteMutex    sync.RWMutex
+	isDeleting     bool
 )
 
-var htmlTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watched Movies</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .refresh-btn { 
-            padding: 10px 20px; 
-            background: #4CAF50; 
-            color: white; 
-            border: none; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            font-size: 16px;
-        }
-        .refresh-btn:disabled { background: #666; cursor: not-allowed; }
-        .status { color: #aaa; font-size: 14px; }
-        .movie { 
-            margin-bottom: 20px; 
-            border: 1px solid #333; 
-            padding: 15px; 
-            background: #2a2a2a;
-            border-radius: 4px;
-            display: flex;
-            gap: 15px;
-        }
-        .movie-content { flex: 1; }
-        .movie-checkbox { 
-            display: flex; 
-            align-items: center; 
-        }
-        .movie-checkbox input { 
-            width: 20px; 
-            height: 20px; 
-            cursor: pointer; 
-        }
-        img { max-width: 200px; height: auto; border-radius: 4px; }
-        .delete-btn {
-            padding: 12px 24px;
-            background: #f44336;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-            margin-top: 20px;
-        }
-        .delete-btn:disabled { background: #666; cursor: not-allowed; }
-        h1 { margin: 0; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>Watched Movies</h1>
-            <div class="status" id="status">
-                {{if .LastRefresh.IsZero}}
-                    No data loaded. Click refresh to load.
-                {{else}}
-                    Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
-                {{end}}
-            </div>
-        </div>
-        <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
-    </div>
-    
-    {{if .Items}}
-    <button class="delete-btn" onclick="deleteSelected()">Delete Selected</button>
-    
-    {{range .Items}}
-    <div class="movie">
-        <div class="movie-checkbox">
-            <input type="checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}">
-        </div>
-        <div class="movie-content">
-            <h2>{{.Name}} {{if .ProductionYear}}({{.ProductionYear}}){{end}}</h2>
-            <p>{{.Overview}}</p>
-            <p><strong>Size:</strong> {{printf "%.2f" .SizeGB}} GB</p>
-            <p><strong>Path:</strong> {{.Path}}</p>
-        </div>
-        {{if .ImageTags.Primary}}
-        <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
-        {{end}}
-    </div>
-    {{end}}
-    {{else}}
-    <p style="color: #aaa;">No movies loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
-    {{end}}
-    
-    <script>
-        function refreshData() {
-            const btn = document.getElementById('refreshBtn');
-            const status = document.getElementById('status');
-            btn.disabled = true;
-            btn.textContent = 'Refreshing...';
-            status.textContent = 'Fetching data from Jellyfin...';
-            
-            fetch('/refresh', { method: 'POST' })
-                .then(r => r.text())
-                .then(() => {
-                    checkRefreshStatus();
-                });
-        }
-        
-        function checkRefreshStatus() {
-            fetch('/refresh-status')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.isRefreshing) {
-                        document.getElementById('status').textContent = data.message;
-                        setTimeout(checkRefreshStatus, 1000);
-                    } else {
-                        location.reload();
-                    }
-                });
-        }
-        
-        function deleteSelected() {
-            const checked = document.querySelectorAll('input[name="movie"]:checked');
-            if (checked.length === 0) {
-                alert('Please select at least one movie to delete');
-                return;
-            }
-            
-            if (!confirm('Delete ' + checked.length + ' movie(s)? This cannot be undone!')) {
-                return;
-            }
-            
-            const ids = Array.from(checked).map(cb => cb.value);
-            
-            fetch('/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: ids, type: 'movie' })
-            })
-            .then(r => r.text())
-            .then(msg => {
-                alert(msg);
-                location.reload();
-            });
-        }
-    </script>
-</body>
-</html>`
+// Load templates from files
+var tmpl *template.Template
+var tvTmpl *template.Template
+var deletePreviewTmpl *template.Template
+var deleteProgressTmpl *template.Template
+var deleteSummaryTmpl *template.Template
 
-var tmpl = template.Must(template.New("movies").Funcs(template.FuncMap{
-	"formatTime": func(t time.Time) string {
-		return t.Format("Jan 2, 2006 3:04 PM")
-	},
-}).Parse(htmlTemplate))
+func initTemplates() {
+	var err error
+	funcMap := template.FuncMap{
+		"formatTime": func(t time.Time) string {
+			return t.Format("Jan 2, 2006 3:04 PM")
+		},
+		"add": func(a, b float64) float64 {
+			return a + b
+		},
+		"daysAgo": func(t time.Time) int {
+			return int(time.Since(t).Hours() / 24)
+		},
+	}
 
-var tvTemplate = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Watched TV Shows</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .controls { display: flex; gap: 10px; margin-bottom: 20px; align-items: center; }
-        .refresh-btn { 
-            padding: 10px 20px; 
-            background: #4CAF50; 
-            color: white; 
-            border: none; 
-            border-radius: 4px; 
-            cursor: pointer; 
-            font-size: 16px;
-        }
-        .refresh-btn:disabled { background: #666; cursor: not-allowed; }
-        .status { color: #aaa; font-size: 14px; }
-        .series { 
-            margin-bottom: 20px; 
-            border: 1px solid #333; 
-            padding: 15px; 
-            background: #2a2a2a;
-            border-radius: 4px;
-            display: flex;
-            gap: 15px;
-        }
-        .series-content { flex: 1; }
-        .season { 
-            margin-left: 20px; 
-            padding: 10px;
-            border-left: 3px solid #4CAF50;
-            margin-top: 10px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        .season input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            cursor: pointer;
-        }
-        img { max-width: 200px; height: auto; border-radius: 4px; }
-        .delete-btn {
-            padding: 12px 24px;
-            background: #f44336;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-        }
-        .delete-btn:disabled { background: #666; cursor: not-allowed; }
-        h1 { margin: 0; }
-        select, input[type="number"] {
-            padding: 8px;
-            background: #333;
-            color: #fff;
-            border: 1px solid #555;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        label { color: #aaa; font-size: 14px; }
-        .select-all { margin-left: 10px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div>
-            <h1>Watched TV Shows</h1>
-            <div class="status" id="status">
-                {{if .LastRefresh.IsZero}}
-                    No data loaded. Click refresh to load.
-                {{else}}
-                    Last updated: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
-                {{end}}
-            </div>
-        </div>
-        <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">Refresh Data</button>
-    </div>
-    
-    {{if .Series}}
-    <div class="controls">
-        <label>Sort by:</label>
-        <select id="sortBy" onchange="applyFilters()">
-            <option value="name">Name</option>
-            <option value="size-desc">Size (Largest First)</option>
-            <option value="size-asc">Size (Smallest First)</option>
-        </select>
-        
-        <label>Min Size (GB):</label>
-        <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
-        
-        <label>
-            <input type="checkbox" id="fullyWatched" onchange="applyFilters()">
-            Fully watched only
-        </label>
-        
-        <button class="select-all" onclick="selectAll()">Select All</button>
-        <button class="select-all" onclick="deselectAll()">Deselect All</button>
-    </div>
-    
-    <button class="delete-btn" onclick="deleteSelected()">Delete Selected Seasons</button>
-    
-    <div id="seriesList">
-    {{range .Series}}
-    <div class="series" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}">
-        {{if .ImageTags.Primary}}
-        <img src="http://nas.home.arpa:8096/Items/{{.Id}}/Images/Primary?maxWidth=200" alt="{{.Name}}">
-        {{end}}
-        <div class="series-content">
-            <h2>{{.Name}} ({{printf "%.2f" .TotalSize}} GB total)</h2>
-            {{range .Seasons}}
-            <div class="season">
-                <input type="checkbox" name="season" value="{{.SeasonId}}">
-                <div>
-                    <strong>Season {{.SeasonNumber}}:</strong> {{.WatchedCount}}/{{.TotalCount}} episodes watched ({{printf "%.2f" .SizeGB}} GB)
-                </div>
-            </div>
-            {{end}}
-        </div>
-    </div>
-    {{end}}
-    </div>
-    {{else}}
-    <p style="color: #aaa;">No TV shows loaded. Click "Refresh Data" to fetch from Jellyfin.</p>
-    {{end}}
-    
-    <script>
-        function refreshData() {
-            const btn = document.getElementById('refreshBtn');
-            const status = document.getElementById('status');
-            btn.disabled = true;
-            btn.textContent = 'Refreshing...';
-            status.textContent = 'Starting refresh...';
-            
-            fetch('/refresh-tv', { method: 'POST' })
-                .then(r => r.text())
-                .then(() => {
-                    checkRefreshStatus();
-                });
-        }
-        
-        function checkRefreshStatus() {
-            fetch('/refresh-status')
-                .then(r => r.json())
-                .then(data => {
-                    if (data.isRefreshing) {
-                        document.getElementById('status').textContent = data.message;
-                        setTimeout(checkRefreshStatus, 1000);
-                    } else {
-                        location.reload();
-                    }
-                });
-        }
-        
-        function applyFilters() {
-            const sortBy = document.getElementById('sortBy').value;
-            const minSize = parseFloat(document.getElementById('minSize').value) || 0;
-            const fullyWatched = document.getElementById('fullyWatched').checked;
-            
-            const container = document.getElementById('seriesList');
-            const series = Array.from(container.children);
-            
-            series.forEach(s => {
-                const size = parseFloat(s.dataset.size);
-                const isFullyWatched = s.dataset.fullyWatched === 'true';
-                
-                let show = size >= minSize;
-                if (fullyWatched && !isFullyWatched) show = false;
-                
-                s.style.display = show ? 'flex' : 'none';
-            });
-            
-            const visibleSeries = series.filter(s => s.style.display !== 'none');
-            
-            visibleSeries.sort((a, b) => {
-                if (sortBy === 'name') {
-                    return a.dataset.name.localeCompare(b.dataset.name);
-                } else if (sortBy === 'size-desc') {
-                    return parseFloat(b.dataset.size) - parseFloat(a.dataset.size);
-                } else if (sortBy === 'size-asc') {
-                    return parseFloat(a.dataset.size) - parseFloat(b.dataset.size);
-                }
-                return 0;
-            });
-            
-            visibleSeries.forEach(s => container.appendChild(s));
-        }
-        
-        function selectAll() {
-            document.querySelectorAll('input[name="season"]').forEach(cb => {
-                if (cb.closest('.series').style.display !== 'none') {
-                    cb.checked = true;
-                }
-            });
-        }
-        
-        function deselectAll() {
-            document.querySelectorAll('input[name="season"]:checked').forEach(cb => cb.checked = false);
-        }
-        
-        function deleteSelected() {
-            const checked = document.querySelectorAll('input[name="season"]:checked');
-            if (checked.length === 0) {
-                alert('Please select at least one season to delete');
-                return;
-            }
-            
-            if (!confirm('Delete ' + checked.length + ' season(s)? This cannot be undone!')) {
-                return;
-            }
-            
-            const ids = Array.from(checked).map(cb => cb.value);
-            
-            fetch('/delete', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: ids, type: 'season' })
-            })
-            .then(r => r.text())
-            .then(msg => {
-                alert(msg);
-                location.reload();
-            });
-        }
-    </script>
-</body>
-</html>`
+	// Try to find templates relative to executable or current directory
+	templateDir := "templates"
+	if _, err := os.Stat(templateDir); os.IsNotExist(err) {
+		// Try relative to executable
+		exe, err := os.Executable()
+		if err == nil {
+			exeDir := filepath.Dir(exe)
+			possibleDir := filepath.Join(exeDir, "templates")
+			if _, err := os.Stat(possibleDir); err == nil {
+				templateDir = possibleDir
+			}
+		}
+	}
 
-var tvTmpl = template.Must(template.New("tv").Funcs(template.FuncMap{
-	"formatTime": func(t time.Time) string {
-		return t.Format("Jan 2, 2006 3:04 PM")
-	},
-}).Parse(tvTemplate))
+	tmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "movies.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading movies template: %v", err))
+	}
+
+	tvTmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "tv.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading TV template: %v", err))
+	}
+
+	deletePreviewTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-preview.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete preview template: %v", err))
+	}
+
+	deleteProgressTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-progress.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete progress template: %v", err))
+	}
+
+	deleteSummaryTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-summary.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete summary template: %v", err))
+	}
+}
+
+// loadEnvFile loads environment variables from .env file if it exists
+// This is for local development - Docker uses docker-compose.yml
+func loadEnvFile() {
+	envFile := ".env"
+	if _, err := os.Stat(envFile); os.IsNotExist(err) {
+		return // .env file doesn't exist, skip
+	}
+
+	file, err := os.Open(envFile)
+	if err != nil {
+		fmt.Printf("watched-cleanup: Warning - could not open .env file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse KEY=VALUE format
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Remove quotes if present
+			value = strings.Trim(value, "\"'")
+
+			// Only set if not already set (allows override via actual env vars)
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+}
 
 func main() {
+	// Load .env file for local development (Docker uses docker-compose.yml)
+	loadEnvFile()
+
+	initTemplates()
+
 	http.HandleFunc("/", handleMovies)
 	http.HandleFunc("/tv", handleTV)
 	http.HandleFunc("/refresh", handleRefreshMovies)
 	http.HandleFunc("/refresh-tv", handleRefreshTV)
 	http.HandleFunc("/refresh-status", handleRefreshStatus)
-	http.HandleFunc("/delete", handleDelete)
-	fmt.Println("watched-cleanup v1.0.1 - hardlink test starting...")
+	http.HandleFunc("/delete-preview", handleDeletePreview)
+	http.HandleFunc("/delete-confirm", handleDeleteConfirm)
+	http.HandleFunc("/delete-progress", handleDeleteProgress)
+	http.HandleFunc("/delete", handleDelete) // Keep for backwards compatibility
+
+	// Test endpoints for Radarr/Sonarr API
+	http.HandleFunc("/test/radarr/movies", handleTestRadarrMovies)
+	http.HandleFunc("/test/radarr/search-path", handleTestRadarrSearchPath)
+	http.HandleFunc("/test/radarr/search-title", handleTestRadarrSearchTitle)
+	http.HandleFunc("/test/sonarr/series", handleTestSonarrSeries)
+	http.HandleFunc("/test/sonarr/search-path", handleTestSonarrSearchPath)
+	http.HandleFunc("/test/sonarr/search-title", handleTestSonarrSearchTitle)
+
+	fmt.Println("watched-cleanup v1.0.2 - hardlink test starting...")
 	fmt.Println("Server starting on :6969")
+	fmt.Println("Test endpoints available:")
+	fmt.Println("  GET /test/radarr/movies - List all Radarr movies")
+	fmt.Println("  GET /test/radarr/search-path?path=<filepath> - Search Radarr by file path")
+	fmt.Println("  GET /test/radarr/search-title?title=<title>&year=<year> - Search Radarr by title and year")
+	fmt.Println("  GET /test/sonarr/series - List all Sonarr series")
+	fmt.Println("  GET /test/sonarr/search-path?path=<filepath> - Search Sonarr by file path")
+	fmt.Println("  GET /test/sonarr/search-title?title=<title> - Search Sonarr by title")
 	http.ListenAndServe(":6969", nil)
 
 }
 
-func fetchAPI(request_type string, id string) ([]byte, error) {
-	jellyfin_user_id := os.Getenv("JELLYFIN_USER_ID")
-
-	var api string
-	if request_type == "played_movies" {
-		api = "Users/" + jellyfin_user_id + "/Items?Recursive=true&IsPlayed=true&IncludeItemTypes=Movie"
-	} else if request_type == "watched_episodes" {
-		api = "Users/" + jellyfin_user_id + "/Items?Recursive=true&IsPlayed=true&IncludeItemTypes=Episode"
-	} else if request_type == "season_details" {
-		api = "Items/" + id + "?userId=" + jellyfin_user_id
-	} else if request_type == "season_info" {
-		api = "Items/" + id + "?userId=" + jellyfin_user_id
-	} else if request_type == "series_seasons" {
-		api = "Shows/" + id + "/Seasons?userId=" + jellyfin_user_id
-	} else if request_type == "movie_details" {
-		api = "Users/" + jellyfin_user_id + "/Items/" + id
-	} else if request_type == "episode_details" {
-		api = "Users/" + jellyfin_user_id + "/Items/" + id
-	} else if request_type == "season_episodes" {
-		api = "Users/" + jellyfin_user_id + "/Items?ParentId=" + id + "&Fields=MediaSources"
-	} else if request_type == "series_details" {
-		api = "Users/" + jellyfin_user_id + "/Items/" + id
-	}
-
-	baseurl := os.Getenv("JELLYFIN_BASE_URL")
-
-	url := baseurl + api
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	token := os.Getenv("JELLYFIN_API_KEY")
-
-	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
-}
-
 func updateProgress(current, total int, message string) {
 	progressMutex.Lock()
-	refreshProgress = RefreshProgress{
+	refreshProgress = models.RefreshProgress{
 		Current: current,
 		Total:   total,
 		Message: message,
@@ -560,15 +199,20 @@ func handleMovies(w http.ResponseWriter, r *http.Request) {
 	defer cacheMutex.RUnlock()
 
 	data := struct {
-		Items       []Movie
-		LastRefresh time.Time
+		Items           []models.Movie
+		LastRefresh     time.Time
+		JellyfinBaseURL string
 	}{
-		Items:       cachedMovies.Items,
-		LastRefresh: lastRefresh,
+		Items:           cachedMovies.Items,
+		LastRefresh:     lastRefresh,
+		JellyfinBaseURL: os.Getenv("JELLYFIN_BASE_URL"),
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	tmpl.Execute(w, data)
+	if err := tmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
 }
 
 func handleTV(w http.ResponseWriter, r *http.Request) {
@@ -577,7 +221,7 @@ func handleTV(w http.ResponseWriter, r *http.Request) {
 
 	// Calculate if each series is fully watched
 	type EnhancedSeries struct {
-		Series
+		models.Series
 		FullyWatched bool
 	}
 
@@ -597,16 +241,19 @@ func handleTV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Series      []EnhancedSeries
-		LastRefresh time.Time
+		Series          []EnhancedSeries
+		LastRefresh     time.Time
+		JellyfinBaseURL string
 	}{
-		Series:      enhancedSeries,
-		LastRefresh: lastRefresh,
+		Series:          enhancedSeries,
+		LastRefresh:     lastRefresh,
+		JellyfinBaseURL: os.Getenv("JELLYFIN_BASE_URL"),
 	}
 
 	w.Header().Set("Content-Type", "text/html")
-	if err := tvTmpl.Execute(w, data); err != nil {
-		fmt.Println("Template error:", err)
+	if err := tvTmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
 	}
 }
 
@@ -623,7 +270,7 @@ func handleRefreshMovies(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		fmt.Println("Starting movie refresh...")
 		updateProgress(0, 0, "Fetching movie list...")
-		newMovies := fetchMovieData()
+		newMovies := jellyfin.FetchMovieData(httpClient, updateProgress)
 
 		cacheMutex.Lock()
 		cachedMovies = newMovies
@@ -650,7 +297,7 @@ func handleRefreshTV(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		fmt.Println("Starting TV refresh...")
 		updateProgress(0, 0, "Fetching episode list...")
-		newSeries := fetchTVData()
+		newSeries := jellyfin.FetchTVData(httpClient, updateProgress)
 
 		cacheMutex.Lock()
 		cachedSeries = newSeries
@@ -681,80 +328,225 @@ func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 		"total":        progress.Total,
 	})
 }
-func callJellyfinDelete(id string) {
-	baseurl := os.Getenv("JELLYFIN_BASE_URL")
-	token := os.Getenv("JELLYFIN_API_KEY")
-	url := fmt.Sprintf("%sItems/%s", baseurl, id)
 
-	req, _ := http.NewRequest("DELETE", url, nil)
-	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
+func handleDeletePreview(w http.ResponseWriter, r *http.Request) {
+	deleteType := r.URL.Query().Get("type")
+	idsParam := r.URL.Query().Get("ids")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids parameter", http.StatusBadRequest)
+		return
+	}
+
+	ids := []string{}
+	for _, id := range splitIDs(idsParam) {
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch preview items
+	previewItems := []struct {
+		Name   string
+		SizeGB float64
+		Path   string
+	}{}
+
+	cacheMutex.RLock()
+	if deleteType == "movie" {
+		for _, id := range ids {
+			for _, movie := range cachedMovies.Items {
+				if movie.Id == id {
+					previewItems = append(previewItems, struct {
+						Name   string
+						SizeGB float64
+						Path   string
+					}{
+						Name:   movie.Name,
+						SizeGB: movie.SizeGB,
+						Path:   movie.Path,
+					})
+					break
+				}
+			}
+		}
+	} else if deleteType == "season" {
+		for _, id := range ids {
+			for _, series := range cachedSeries {
+				for _, season := range series.Seasons {
+					if season.SeasonId == id {
+						previewItems = append(previewItems, struct {
+							Name   string
+							SizeGB float64
+							Path   string
+						}{
+							Name:   fmt.Sprintf("%s - Season %d", series.Name, season.SeasonNumber),
+							SizeGB: season.SizeGB,
+							Path:   fmt.Sprintf("Season %d", season.SeasonNumber),
+						})
+						break
+					}
+				}
+			}
+		}
+	}
+	cacheMutex.RUnlock()
+
+	data := struct {
+		Type  string
+		Ids   string
+		Items []struct {
+			Name   string
+			SizeGB float64
+			Path   string
+		}
+	}{
+		Type:  deleteType,
+		Ids:   idsParam,
+		Items: previewItems,
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := deletePreviewTmpl.Execute(w, data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
 	}
 }
 
-// Add this function to find hardlinks by inode
-func findHardlinks(targetPath string, searchDir string) ([]string, error) {
-	// Get the inode of the target file
-	targetInfo, err := os.Stat(targetPath)
-	if err != nil {
-		return nil, err
+func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
+	var deleteType, idsParam string
+	dryRun := false
+
+	// Check for global dry-run mode via environment variable
+	// If set, force dry-run mode regardless of request parameters
+	envDryRun := os.Getenv("DRY_RUN_MODE")
+	if envDryRun == "true" || envDryRun == "1" || strings.ToLower(envDryRun) == "yes" {
+		dryRun = true
+		fmt.Printf("watched-cleanup: DRY_RUN_MODE environment variable is enabled - all deletions will be in test mode\n")
 	}
 
-	targetStat, ok := targetInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, fmt.Errorf("failed to get stat info")
+	// Support both GET (query params) and POST (form/JSON)
+	if r.Method == "POST" {
+		if r.Header.Get("Content-Type") == "application/json" {
+			var req struct {
+				Type   string `json:"type"`
+				Ids    string `json:"ids"`
+				DryRun bool   `json:"dryRun"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+				deleteType = req.Type
+				idsParam = req.Ids
+				// Only use request dryRun if env var is not set
+				if envDryRun == "" {
+					dryRun = req.DryRun
+				}
+			}
+		} else {
+			// Form data
+			deleteType = r.FormValue("type")
+			idsParam = r.FormValue("ids")
+			// Only use request dryRun if env var is not set
+			if envDryRun == "" {
+				dryRun = r.FormValue("dryRun") == "true" || r.FormValue("test") == "true"
+			}
+		}
+	} else {
+		// GET request
+		deleteType = r.URL.Query().Get("type")
+		idsParam = r.URL.Query().Get("ids")
+		// Only use request dryRun if env var is not set
+		if envDryRun == "" {
+			dryRun = r.URL.Query().Get("dryRun") == "true" || r.URL.Query().Get("test") == "true"
+		}
 	}
-	targetInode := targetStat.Ino
 
-	var matches []string
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids", http.StatusBadRequest)
+		return
+	}
 
-	// Walk the search directory
-	err = filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors, continue walking
-		}
+	ids := splitIDs(idsParam)
 
-		if info.IsDir() {
-			return nil // Skip directories
-		}
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
 
-		// Get inode of current file
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil
-		}
+	// Start delete operation in background
+	deleteMutex.Lock()
+	if isDeleting {
+		deleteMutex.Unlock()
+		http.Error(w, "Delete already in progress", http.StatusConflict)
+		return
+	}
+	isDeleting = true
+	message := "Starting deletion..."
+	if dryRun {
+		message = "Starting TEST MODE (dry-run) - no files will be deleted..."
+	}
+	deleteProgress = models.DeleteProgress{
+		Total:             len(ids),
+		Current:           0,
+		Message:           message,
+		Percent:           0,
+		StageJellyfin:     "pending",
+		StageInode:        "pending",
+		StageRadarrSonarr: "pending",
+		EpisodeCurrent:    0,
+		EpisodeTotal:      0,
+		StageErrors:       []string{},
+	}
+	deleteResult = models.DeleteResult{
+		Items:      []models.DeletedItem{},
+		Errors:     []string{},
+		TotalSizeGB: 0,
+		DryRun:     dryRun,
+	}
+	deleteMutex.Unlock()
 
-		// If inodes match, this is a hardlink
-		if stat.Ino == targetInode {
-			matches = append(matches, path)
-		}
+	// Show progress modal immediately
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, deleteProgress)
 
-		return nil
-	})
-
-	return matches, err
+	// Start deletion in background
+	go deletion.PerformDelete(httpClient, ids, deleteType, dryRun, &deleteProgress, &deleteResult, &cacheMutex, &cachedMovies, &cachedSeries, &deleteMutex, &isDeleting)
 }
 
-// Add this function to find all files in a directory recursively
-func getAllFilesInDir(dirPath string) ([]string, error) {
-	var files []string
+func handleDeleteProgress(w http.ResponseWriter, r *http.Request) {
+	deleteMutex.RLock()
+	progress := deleteProgress
+	deleting := isDeleting
+	deleteMutex.RUnlock()
 
-	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
+	if !deleting {
+		// Deletion complete, show summary
+		deleteMutex.RLock()
+		result := deleteResult
+		deleteMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		deleteSummaryTmpl.Execute(w, result)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, progress)
+}
+
+func splitIDs(idsParam string) []string {
+	ids := []string{}
+	for _, id := range strings.Split(idsParam, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, id)
 		}
-
-		if !info.IsDir() {
-			files = append(files, path)
-		}
-
-		return nil
-	})
-
-	return files, err
+	}
+	return ids
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -778,13 +570,13 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 			// For seasons, we need to get all episodes first
 			fmt.Printf("watched-cleanup: Fetching episodes for season %s\n", id)
 
-			seasonEpisodesBody, err := fetchAPI("season_episodes", id)
+			seasonEpisodesBody, err := jellyfin.FetchAPI(httpClient, "season_episodes", id)
 			if err != nil {
 				fmt.Printf("  Error fetching season episodes: %v\n", err)
 				continue
 			}
 
-			var seasonEpisodes EpisodeList
+			var seasonEpisodes models.EpisodeList
 			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
 				fmt.Printf("  Error unmarshaling season episodes: %v\n", err)
 				continue
@@ -794,11 +586,11 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 			// Get the path for each episode
 			for _, ep := range seasonEpisodes.Items {
-				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
+				episodeDetailsBody, err := jellyfin.FetchAPI(httpClient, "episode_details", ep.Id)
 				if err != nil {
 					continue
 				}
-				var details MovieDetails
+				var details models.MovieDetails
 				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
 					continue
 				}
@@ -812,9 +604,9 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if req.Type == "movie" {
 			// For movies, get the single file path
-			detailsBody, err := fetchAPI("movie_details", id)
+			detailsBody, err := jellyfin.FetchAPI(httpClient, "movie_details", id)
 			if err == nil {
-				var details MovieDetails
+				var details models.MovieDetails
 				json.Unmarshal(detailsBody, &details)
 				if len(details.MediaSources) > 0 {
 					path := details.MediaSources[0].Path
@@ -837,7 +629,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 
-				hardlinks, err := findHardlinks(filePath, "/data/torrents")
+				hardlinks, err := filesystem.FindHardlinks(filePath, "/data/torrents")
 				if err != nil {
 					fmt.Printf("  Error finding hardlinks for %s: %v\n", filePath, err)
 					continue
@@ -867,7 +659,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 
 		// 3. Tell Jellyfin to delete the item from its database
 		fmt.Printf("  Deleting from Jellyfin database: %s\n", id)
-		callJellyfinDelete(id)
+		jellyfin.CallJellyfinDelete(httpClient, id)
 	}
 
 	responseMsg := fmt.Sprintf("Successfully deleted %d %s(s)", len(req.Ids), req.Type)
@@ -879,236 +671,235 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(responseMsg))
 }
 
-func fetchMovieData() MovieList {
-	body, err := fetchAPI("played_movies", "")
+// Test handlers for Radarr/Sonarr API
+func handleTestRadarrMovies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	baseurl := os.Getenv("RADARR_BASE_URL")
+	apiKey := os.Getenv("RADARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		http.Error(w, `{"error": "Radarr not configured"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	url := fmt.Sprintf("%sapi/v3/movie", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		fmt.Println("Error fetching movies:", err)
-		return MovieList{}
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to create request: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "API request failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to read response: %v"}`, err), http.StatusInternalServerError)
+		return
 	}
 
-	var movieList MovieList
-	if err := json.Unmarshal(body, &movieList); err != nil {
-		fmt.Println("Error parsing movies:", err)
-		return MovieList{}
+	if resp.StatusCode != 200 {
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
 	}
 
-	fmt.Println("Number of movies:", len(movieList.Items))
-
-	// Parallelize movie detail fetching
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // Limit to 10 concurrent requests
-	var mu sync.Mutex
-	var completed int32
-
-	for i := range movieList.Items {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			sem <- struct{}{}        // Acquire semaphore
-			defer func() { <-sem }() // Release semaphore
-
-			detailsBody, err := fetchAPI("movie_details", movieList.Items[idx].Id)
-			if err != nil {
-				atomic.AddInt32(&completed, 1)
-				return
-			}
-			var details MovieDetails
-			if err := json.Unmarshal(detailsBody, &details); err != nil {
-				atomic.AddInt32(&completed, 1)
-				return
-			}
-			if len(details.MediaSources) > 0 {
-				mu.Lock()
-				movieList.Items[idx].Size = details.MediaSources[0].Size
-				movieList.Items[idx].SizeGB = float64(details.MediaSources[0].Size) / (1024 * 1024 * 1024)
-				movieList.Items[idx].Path = details.MediaSources[0].Path
-				mu.Unlock()
-			}
-
-			current := atomic.AddInt32(&completed, 1)
-			updateProgress(int(current), len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d", int(current), len(movieList.Items)))
-		}(i)
+	// Pretty print JSON
+	var movies []models.RadarrMovie
+	if err := json.Unmarshal(body, &movies); err != nil {
+		w.Write(body)
+		return
 	}
 
-	wg.Wait()
-	return movieList
+	prettyJSON, _ := json.MarshalIndent(map[string]interface{}{
+		"count":  len(movies),
+		"movies": movies,
+	}, "", "  ")
+	w.Write(prettyJSON)
 }
 
-func fetchTVData() []Series {
-	body, err := fetchAPI("watched_episodes", "")
+func handleTestRadarrSearchPath(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, `{"error": "Missing 'path' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	movie, err := radarr.SearchByPath(httpClient, filePath)
 	if err != nil {
-		fmt.Println("Error fetching episodes:", err)
-		return nil
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"path":  filePath,
+		})
+		return
 	}
 
-	var episodeList EpisodeList
-	if err := json.Unmarshal(body, &episodeList); err != nil {
-		fmt.Println("Error parsing episodes:", err)
-		return nil
-	}
-
-	fmt.Println("Unmarshaled", len(episodeList.Items), "episodes")
-
-	grouped := make(map[string]*Series)
-
-	for _, ep := range episodeList.Items {
-		seriesId := ep.SeriesId
-		if grouped[seriesId] == nil {
-			// Fetch series details to get artwork
-			seriesBody, err := fetchAPI("series_details", seriesId)
-			if err == nil {
-				var seriesDetails struct {
-					ImageTags map[string]string `json:"ImageTags"`
-				}
-				json.Unmarshal(seriesBody, &seriesDetails)
-				grouped[seriesId] = &Series{
-					Name:      ep.SeriesName,
-					Id:        seriesId,
-					ImageTags: seriesDetails.ImageTags,
-				}
-			} else {
-				grouped[seriesId] = &Series{
-					Name:      ep.SeriesName,
-					Id:        seriesId,
-					ImageTags: make(map[string]string),
-				}
-			}
-			fmt.Println("New series:", ep.SeriesName)
-		}
-		seasonNum := ep.ParentIndexNumber
-		found := false
-		for i := range grouped[seriesId].Seasons {
-			if grouped[seriesId].Seasons[i].SeasonNumber == seasonNum {
-				grouped[seriesId].Seasons[i].WatchedCount++
-				found = true
-				break
-			}
-		}
-		if !found {
-			grouped[seriesId].Seasons = append(grouped[seriesId].Seasons, SeasonInfo{
-				SeasonNumber: seasonNum,
-				SeasonId:     ep.SeasonId,
-				WatchedCount: 1,
-			})
-			fmt.Printf("  New season %d for %s (SeasonId: %s)\n", seasonNum, ep.SeriesName, ep.SeasonId)
-		}
-	}
-
-	fmt.Println("Fetching season details for", len(grouped), "series...")
-
-	totalSeries := len(grouped)
-	var seriesCompleted int32
-
-	// Process each series
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	for _, series := range grouped {
-		wg.Add(1)
-		go func(s *Series) {
-			defer wg.Done()
-
-			fmt.Println("Processing series:", s.Name, "with", len(s.Seasons), "seasons")
-
-			// Process seasons for this series
-			var seasonWg sync.WaitGroup
-			seasonSem := make(chan struct{}, 5) // Limit concurrent season fetches
-
-			for i := range s.Seasons {
-				seasonWg.Add(1)
-				go func(idx int) {
-					defer seasonWg.Done()
-					seasonSem <- struct{}{}
-					defer func() { <-seasonSem }()
-
-					fmt.Printf("  Fetching info for season %d (ID: %s)\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SeasonId)
-
-					seasonInfoBody, err := fetchAPI("season_info", s.Seasons[idx].SeasonId)
-					if err != nil {
-						fmt.Println("    Error fetching season info:", err)
-						return
-					}
-					var seasonInfo SeasonDetails
-					if err := json.Unmarshal(seasonInfoBody, &seasonInfo); err != nil {
-						fmt.Println("    Error unmarshaling season info:", err)
-						return
-					}
-					s.Seasons[idx].TotalCount = seasonInfo.ChildCount
-					fmt.Printf("    Season %d: %d episodes total\n", s.Seasons[idx].SeasonNumber, seasonInfo.ChildCount)
-
-					seasonEpisodesBody, err := fetchAPI("season_episodes", s.Seasons[idx].SeasonId)
-					if err != nil {
-						fmt.Println("    Error fetching season episodes:", err)
-						return
-					}
-					var seasonEpisodes EpisodeList
-					if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
-						fmt.Println("    Error unmarshaling season episodes:", err)
-						return
-					}
-
-					fmt.Printf("    Fetching sizes for %d episodes\n", len(seasonEpisodes.Items))
-
-					// Parallelize episode size fetching
-					var epWg sync.WaitGroup
-					epSem := make(chan struct{}, 10) // Limit concurrent episode fetches
-					var sizeMu sync.Mutex
-					var totalSize int64
-
-					for _, ep := range seasonEpisodes.Items {
-						epWg.Add(1)
-						go func(episode Episode) {
-							defer epWg.Done()
-							epSem <- struct{}{}
-							defer func() { <-epSem }()
-
-							episodeDetailsBody, err := fetchAPI("episode_details", episode.Id)
-							if err != nil {
-								return
-							}
-							var details MovieDetails
-							if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
-								return
-							}
-							if len(details.MediaSources) > 0 {
-								sizeMu.Lock()
-								totalSize += details.MediaSources[0].Size
-								sizeMu.Unlock()
-							}
-						}(ep)
-					}
-
-					epWg.Wait()
-					s.Seasons[idx].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
-
-					mu.Lock()
-					s.TotalSize += s.Seasons[idx].SizeGB
-					mu.Unlock()
-
-					fmt.Printf("    Season %d: %.2f GB total\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SizeGB)
-				}(i)
-			}
-
-			seasonWg.Wait()
-
-			// Update progress after series completes
-			current := atomic.AddInt32(&seriesCompleted, 1)
-			updateProgress(int(current), totalSeries, fmt.Sprintf("Completed %d/%d series", int(current), totalSeries))
-		}(series)
-	}
-
-	wg.Wait()
-
-	var seriesList []Series
-	for _, s := range grouped {
-		seriesList = append(seriesList, *s)
-	}
-
-	// Sort by name by default
-	sort.Slice(seriesList, func(i, j int) bool {
-		return seriesList[i].Name < seriesList[j].Name
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found": true,
+		"movie": movie,
+		"path":  filePath,
 	})
-
-	fmt.Println("Returning", len(seriesList), "series")
-	return seriesList
 }
+
+func handleTestRadarrSearchTitle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	title := r.URL.Query().Get("title")
+	yearStr := r.URL.Query().Get("year")
+	if title == "" {
+		http.Error(w, `{"error": "Missing 'title' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	year := 0
+	if yearStr != "" {
+		fmt.Sscanf(yearStr, "%d", &year)
+	}
+
+	movie, err := radarr.SearchByTitle(httpClient, title, year)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"title": title,
+			"year":  year,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found": true,
+		"movie": movie,
+		"title": title,
+		"year":  year,
+	})
+}
+
+func handleTestSonarrSeries(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	baseurl := os.Getenv("SONARR_BASE_URL")
+	apiKey := os.Getenv("SONARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		http.Error(w, `{"error": "Sonarr not configured"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	url := fmt.Sprintf("%sapi/v3/series", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to create request: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "API request failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to read response: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	// Pretty print JSON
+	var seriesList []models.SonarrSeries
+	if err := json.Unmarshal(body, &seriesList); err != nil {
+		w.Write(body)
+		return
+	}
+
+	prettyJSON, _ := json.MarshalIndent(map[string]interface{}{
+		"count":  len(seriesList),
+		"series": seriesList,
+	}, "", "  ")
+	w.Write(prettyJSON)
+}
+
+func handleTestSonarrSearchPath(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, `{"error": "Missing 'path' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	series, seasonNumber, err := sonarr.SearchByPath(httpClient, filePath)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"path":  filePath,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":        true,
+		"series":       series,
+		"seasonNumber": seasonNumber,
+		"path":         filePath,
+	})
+}
+
+func handleTestSonarrSearchTitle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	title := r.URL.Query().Get("title")
+	if title == "" {
+		http.Error(w, `{"error": "Missing 'title' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Season number is optional for title search
+	seasonNumber := 0
+	if seasonStr := r.URL.Query().Get("season"); seasonStr != "" {
+		fmt.Sscanf(seasonStr, "%d", &seasonNumber)
+	}
+
+	series, err := sonarr.SearchByTitle(httpClient, title, seasonNumber)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":        err.Error(),
+			"title":        title,
+			"seasonNumber": seasonNumber,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":        true,
+		"series":       series,
+		"title":        title,
+		"seasonNumber": seasonNumber,
+	})
+}
+

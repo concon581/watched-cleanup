@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{block "title" .}}Watched Cleanup{{end}}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0f0f0f;
+            --bg-secondary: #1a1a1a;
+            --bg-tertiary: #252525;
+            --bg-card: #1e1e1e;
+            --bg-hover: #2a2a2a;
+            --text-primary: #ffffff;
+            --text-secondary: #b3b3b3;
+            --text-muted: #808080;
+            --accent-primary: #00d4ff;
+            --accent-secondary: #00a8cc;
+            --accent-danger: #ff4757;
+            --accent-danger-hover: #ee3542;
+            --accent-success: #2ed573;
+            --accent-success-hover: #26c965;
+            --border-color: #333333;
+            --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+            --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+            --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+            --radius-sm: 8px;
+            --radius-md: 12px;
+            --radius-lg: 16px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 32px 24px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+            padding: 24px;
+            background: var(--bg-card);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow-md);
+            border: 1px solid var(--border-color);
+        }
+
+        .header-content h1 {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .status {
+            color: var(--text-secondary);
+            font-size: 14px;
+            font-weight: 400;
+        }
+
+        .refresh-btn {
+            padding: 12px 24px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: white;
+            border: none;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .refresh-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .refresh-btn:active:not(:disabled) {
+            transform: translateY(0);
+        }
+
+        .refresh-btn:disabled {
+            background: var(--bg-tertiary);
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        /* Modal styles */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(8px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .modal-overlay.show {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--bg-card);
+            border-radius: var(--radius-lg);
+            padding: 32px;
+            max-width: 700px;
+            width: 90%;
+            max-height: 85vh;
+            overflow-y: auto;
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border-color);
+            animation: slideUp 0.3s ease;
+        }
+
+        @keyframes slideUp {
+            from {
+                transform: translateY(20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        .modal-header h2 {
+            margin: 0;
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 28px;
+            cursor: pointer;
+            padding: 0;
+            width: 36px;
+            height: 36px;
+            line-height: 36px;
+            border-radius: var(--radius-sm);
+            transition: all 0.2s ease;
+        }
+
+        .close-btn:hover {
+            color: var(--accent-danger);
+            background: var(--bg-hover);
+        }
+
+        .delete-preview-item {
+            padding: 16px;
+            margin: 12px 0;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            border-left: 4px solid var(--accent-primary);
+            transition: all 0.2s ease;
+        }
+
+        .delete-preview-item:hover {
+            background: var(--bg-hover);
+            transform: translateX(4px);
+        }
+
+        .delete-preview-item strong {
+            color: var(--accent-primary);
+            font-weight: 600;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 36px;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+            margin: 24px 0;
+            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            transition: width 0.4s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .status-message {
+            padding: 16px 20px;
+            margin: 12px 0;
+            border-radius: var(--radius-sm);
+            background: var(--bg-tertiary);
+            border-left: 4px solid var(--accent-primary);
+        }
+
+        .status-message.info {
+            background: rgba(0, 212, 255, 0.1);
+            border-left-color: var(--accent-primary);
+        }
+
+        .status-message.success {
+            background: rgba(46, 213, 115, 0.1);
+            border-left-color: var(--accent-success);
+        }
+
+        .status-message.error {
+            background: rgba(255, 71, 87, 0.1);
+            border-left-color: var(--accent-danger);
+        }
+
+        .summary-item {
+            padding: 14px 16px;
+            margin: 8px 0;
+            background: var(--bg-tertiary);
+            border-radius: var(--radius-sm);
+            transition: all 0.2s ease;
+        }
+
+        .summary-item:hover {
+            background: var(--bg-hover);
+        }
+
+        .summary-item.success {
+            border-left: 4px solid var(--accent-success);
+        }
+
+        .summary-item.error {
+            border-left: 4px solid var(--accent-danger);
+        }
+
+        .modal-actions {
+            display: flex;
+            gap: 12px;
+            justify-content: flex-end;
+            margin-top: 28px;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .btn-danger {
+            background: var(--accent-danger);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: var(--accent-danger-hover);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-secondary:hover {
+            background: var(--bg-hover);
+        }
+
+        .spinner {
+            border: 4px solid var(--bg-tertiary);
+            border-top: 4px solid var(--accent-primary);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 24px auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--bg-tertiary);
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--border-color);
+        }
+    </style>
+    {{block "extra-styles" .}}{{end}}
+</head>
+<body>
+    <div class="container">
+        {{block "content" .}}{{end}}
+    </div>
+    
+    <!-- Modal overlay -->
+    <div id="modalOverlay" class="modal-overlay" onclick="if(event.target === this) closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div id="modalContent">
+                <!-- Modal content will be loaded here via HTMX -->
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function openModal() {
+            document.getElementById('modalOverlay').classList.add('show');
+            document.body.style.overflow = 'hidden';
+        }
+        
+        function closeModal() {
+            document.getElementById('modalOverlay').classList.remove('show');
+            document.getElementById('modalContent').innerHTML = '';
+            document.body.style.overflow = '';
+        }
+        
+        // Close modal on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeModal();
+            }
+        });
+        
+        // HTMX event handlers
+        document.body.addEventListener('htmx:afterSwap', function(evt) {
+            if (evt.detail.target.id === 'modalContent') {
+                openModal();
+            }
+        });
+        
+        // Global function for confirm delete - accessible from dynamically loaded content
+        window.confirmDeleteNow = function(type, ids) {
+            console.log('confirmDeleteNow called', { type, ids });
+            
+            if (!type || !ids) {
+                alert('Error: Missing required information');
+                return;
+            }
+            
+            const modalContent = document.getElementById('modalContent');
+            const btn = event.target;
+            
+            // Disable button
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+            
+            fetch('/delete-confirm?type=' + encodeURIComponent(type) + '&ids=' + encodeURIComponent(ids))
+                .then(r => {
+                    if (!r.ok) {
+                        throw new Error('HTTP ' + r.status + ': ' + r.statusText);
+                    }
+                    return r.text();
+                })
+                .then(html => {
+                    modalContent.innerHTML = html;
+                    // Start polling for progress
+                    let pollCount = 0;
+                    const maxPolls = 600; // 5 minutes max
+                    const pollInterval = setInterval(function() {
+                        pollCount++;
+                        if (pollCount > maxPolls) {
+                            clearInterval(pollInterval);
+                            alert('Delete operation timed out');
+                            return;
+                        }
+                        
+                        fetch('/delete-progress')
+                            .then(r => r.text())
+                            .then(html => {
+                                modalContent.innerHTML = html;
+                                // Stop polling if we see the summary (not "Deleting...")
+                                if (!html.includes('Deleting...')) {
+                                    clearInterval(pollInterval);
+                                }
+                            })
+                            .catch(err => {
+                                console.error('Error polling progress:', err);
+                                clearInterval(pollInterval);
+                            });
+                    }, 500);
+                })
+                .catch(err => {
+                    console.error('Error confirming delete:', err);
+                    alert('Error starting deletion: ' + err.message);
+                    btn.disabled = false;
+                    btn.textContent = 'Confirm Delete';
+                });
+        };
+    </script>
+    {{block "extra-scripts" .}}{{end}}
+</body>
+</html>

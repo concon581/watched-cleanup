@@ -1,0 +1,27 @@
+<div class="modal-header">
+    <h2>Delete Preview</h2>
+    <button class="close-btn" onclick="closeModal()">&times;</button>
+</div>
+
+<div class="status-message info">
+    <strong>You are about to delete:</strong>
+</div>
+
+<div id="previewItems">
+    {{range .Items}}
+    <div class="delete-preview-item">
+        <strong>{{.Name}}</strong><br>
+        <small>Size: {{printf "%.2f" .SizeGB}} GB</small><br>
+        <small>Path: {{.Path}}</small>
+    </div>
+    {{end}}
+</div>
+
+<div class="modal-actions">
+    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+    <button class="btn btn-danger" 
+            onclick="window.confirmDeleteNow('{{.Type}}', '{{.Ids}}')">
+        Confirm Delete
+    </button>
+</div>
+

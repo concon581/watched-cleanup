@@ -1,0 +1,2264 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/concon581/watched-cleanup/deletion"
+	"github.com/concon581/watched-cleanup/filesystem"
+	"github.com/concon581/watched-cleanup/jellyfin"
+	"github.com/concon581/watched-cleanup/models"
+	"github.com/concon581/watched-cleanup/radarr"
+	"github.com/concon581/watched-cleanup/sonarr"
+)
+
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
+var (
+	cachedMovies    models.MovieList
+	cachedSeries    []models.Series
+	isRefreshing    bool
+	lastRefresh     time.Time
+	cacheMutex      sync.RWMutex
+	refreshProgress models.RefreshProgress
+	progressMutex   sync.RWMutex
+
+	// Delete progress tracking
+	deleteProgress models.DeleteProgress
+	deleteResult   models.DeleteResult
+	deleteMutex    sync.RWMutex
+	isDeleting     bool
+)
+
+// Load templates from files
+var tmpl *template.Template
+var tvTmpl *template.Template
+var deletePreviewTmpl *template.Template
+var deleteProgressTmpl *template.Template
+var deleteSummaryTmpl *template.Template
+
+func initTemplates() {
+	var err error
+	funcMap := template.FuncMap{
+		"formatTime": func(t time.Time) string {
+			return t.Format("Jan 2, 2006 3:04 PM")
+		},
+		"add": func(a, b float64) float64 {
+			return a + b
+		},
+		"daysAgo": func(t time.Time) int {
+			return int(time.Since(t).Hours() / 24)
+		},
+	}
+
+	// Try to find templates relative to executable or current directory
+	templateDir := "templates"
+	if _, err := os.Stat(templateDir); os.IsNotExist(err) {
+		// Try relative to executable
+		exe, err := os.Executable()
+		if err == nil {
+			exeDir := filepath.Dir(exe)
+			possibleDir := filepath.Join(exeDir, "templates")
+			if _, err := os.Stat(possibleDir); err == nil {
+				templateDir = possibleDir
+			}
+		}
+	}
+
+	tmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "movies.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading movies template: %v", err))
+	}
+
+	tvTmpl, err = template.New("base.html").Funcs(funcMap).ParseFiles(
+		filepath.Join(templateDir, "base.html"),
+		filepath.Join(templateDir, "tv.html"),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading TV template: %v", err))
+	}
+
+	deletePreviewTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-preview.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete preview template: %v", err))
+	}
+
+	deleteProgressTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-progress.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete progress template: %v", err))
+	}
+
+	deleteSummaryTmpl, err = template.ParseFiles(filepath.Join(templateDir, "delete-summary.html"))
+	if err != nil {
+		panic(fmt.Sprintf("Error loading delete summary template: %v", err))
+	}
+}
+
+// loadEnvFile loads environment variables from .env file if it exists
+// This is for local development - Docker uses docker-compose.yml
+func loadEnvFile() {
+	envFile := ".env"
+	if _, err := os.Stat(envFile); os.IsNotExist(err) {
+		return // .env file doesn't exist, skip
+	}
+
+	file, err := os.Open(envFile)
+	if err != nil {
+		fmt.Printf("watched-cleanup: Warning - could not open .env file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse KEY=VALUE format
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			// Remove quotes if present
+			value = strings.Trim(value, "\"'")
+
+			// Only set if not already set (allows override via actual env vars)
+			if os.Getenv(key) == "" {
+				os.Setenv(key, value)
+			}
+		}
+	}
+}
+
+func main() {
+	// Load .env file for local development (Docker uses docker-compose.yml)
+	loadEnvFile()
+
+	initTemplates()
+
+	http.HandleFunc("/", handleMovies)
+	http.HandleFunc("/tv", handleTV)
+	http.HandleFunc("/refresh", handleRefreshMovies)
+	http.HandleFunc("/refresh-tv", handleRefreshTV)
+	http.HandleFunc("/refresh-status", handleRefreshStatus)
+	http.HandleFunc("/delete-preview", handleDeletePreview)
+	http.HandleFunc("/delete-confirm", handleDeleteConfirm)
+	http.HandleFunc("/delete-progress", handleDeleteProgress)
+	http.HandleFunc("/delete", handleDelete) // Keep for backwards compatibility
+
+	// Test endpoints for Radarr/Sonarr API
+	http.HandleFunc("/test/radarr/movies", handleTestRadarrMovies)
+	http.HandleFunc("/test/radarr/search-path", handleTestRadarrSearchPath)
+	http.HandleFunc("/test/radarr/search-title", handleTestRadarrSearchTitle)
+	http.HandleFunc("/test/sonarr/series", handleTestSonarrSeries)
+	http.HandleFunc("/test/sonarr/search-path", handleTestSonarrSearchPath)
+	http.HandleFunc("/test/sonarr/search-title", handleTestSonarrSearchTitle)
+
+	fmt.Println("watched-cleanup v1.0.2 - hardlink test starting...")
+	fmt.Println("Server starting on :6969")
+	fmt.Println("Test endpoints available:")
+	fmt.Println("  GET /test/radarr/movies - List all Radarr movies")
+	fmt.Println("  GET /test/radarr/search-path?path=<filepath> - Search Radarr by file path")
+	fmt.Println("  GET /test/radarr/search-title?title=<title>&year=<year> - Search Radarr by title and year")
+	fmt.Println("  GET /test/sonarr/series - List all Sonarr series")
+	fmt.Println("  GET /test/sonarr/search-path?path=<filepath> - Search Sonarr by file path")
+	fmt.Println("  GET /test/sonarr/search-title?title=<title> - Search Sonarr by title")
+	http.ListenAndServe(":6969", nil)
+
+}
+
+func updateProgress(current, total int, message string) {
+	progressMutex.Lock()
+	refreshProgress = models.RefreshProgress{
+		Current: current,
+		Total:   total,
+		Message: message,
+	}
+	progressMutex.Unlock()
+}
+
+func handleMovies(w http.ResponseWriter, r *http.Request) {
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+
+	data := struct {
+		Items           []models.Movie
+		LastRefresh     time.Time
+		JellyfinBaseURL string
+	}{
+		Items:           cachedMovies.Items,
+		LastRefresh:     lastRefresh,
+		JellyfinBaseURL: os.Getenv("JELLYFIN_BASE_URL"),
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := tmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
+}
+
+func handleTV(w http.ResponseWriter, r *http.Request) {
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+
+	// Calculate if each series is fully watched
+	type EnhancedSeries struct {
+		models.Series
+		FullyWatched bool
+	}
+
+	enhancedSeries := make([]EnhancedSeries, len(cachedSeries))
+	for i, s := range cachedSeries {
+		fullyWatched := true
+		for _, season := range s.Seasons {
+			if season.WatchedCount < season.TotalCount {
+				fullyWatched = false
+				break
+			}
+		}
+		enhancedSeries[i] = EnhancedSeries{
+			Series:       s,
+			FullyWatched: fullyWatched,
+		}
+	}
+
+	data := struct {
+		Series          []EnhancedSeries
+		LastRefresh     time.Time
+		JellyfinBaseURL string
+	}{
+		Series:          enhancedSeries,
+		LastRefresh:     lastRefresh,
+		JellyfinBaseURL: os.Getenv("JELLYFIN_BASE_URL"),
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := tvTmpl.ExecuteTemplate(w, "base.html", data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
+}
+
+func handleRefreshMovies(w http.ResponseWriter, r *http.Request) {
+	cacheMutex.Lock()
+	if isRefreshing {
+		cacheMutex.Unlock()
+		w.Write([]byte("Already refreshing"))
+		return
+	}
+	isRefreshing = true
+	cacheMutex.Unlock()
+
+	go func() {
+		fmt.Println("Starting movie refresh...")
+		updateProgress(0, 0, "Fetching movie list...")
+		newMovies := jellyfin.FetchMovieData(httpClient, updateProgress)
+
+		cacheMutex.Lock()
+		cachedMovies = newMovies
+		lastRefresh = time.Now()
+		isRefreshing = false
+		cacheMutex.Unlock()
+
+		fmt.Println("Movie refresh complete!")
+	}()
+
+	w.Write([]byte("Refresh started"))
+}
+
+func handleRefreshTV(w http.ResponseWriter, r *http.Request) {
+	cacheMutex.Lock()
+	if isRefreshing {
+		cacheMutex.Unlock()
+		w.Write([]byte("Already refreshing"))
+		return
+	}
+	isRefreshing = true
+	cacheMutex.Unlock()
+
+	go func() {
+		fmt.Println("Starting TV refresh...")
+		updateProgress(0, 0, "Fetching episode list...")
+		newSeries := jellyfin.FetchTVData(httpClient, updateProgress)
+
+		cacheMutex.Lock()
+		cachedSeries = newSeries
+		lastRefresh = time.Now()
+		isRefreshing = false
+		cacheMutex.Unlock()
+
+		fmt.Println("TV refresh complete!")
+	}()
+
+	w.Write([]byte("Refresh started"))
+}
+
+func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
+	cacheMutex.RLock()
+	refreshing := isRefreshing
+	cacheMutex.RUnlock()
+
+	progressMutex.RLock()
+	progress := refreshProgress
+	progressMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isRefreshing": refreshing,
+		"message":      progress.Message,
+		"current":      progress.Current,
+		"total":        progress.Total,
+	})
+}
+
+func handleDeletePreview(w http.ResponseWriter, r *http.Request) {
+	deleteType := r.URL.Query().Get("type")
+	idsParam := r.URL.Query().Get("ids")
+
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids parameter", http.StatusBadRequest)
+		return
+	}
+
+	ids := []string{}
+	for _, id := range splitIDs(idsParam) {
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch preview items
+	previewItems := []struct {
+		Name   string
+		SizeGB float64
+		Path   string
+	}{}
+
+	cacheMutex.RLock()
+	if deleteType == "movie" {
+		for _, id := range ids {
+			for _, movie := range cachedMovies.Items {
+				if movie.Id == id {
+					previewItems = append(previewItems, struct {
+						Name   string
+						SizeGB float64
+						Path   string
+					}{
+						Name:   movie.Name,
+						SizeGB: movie.SizeGB,
+						Path:   movie.Path,
+					})
+					break
+				}
+			}
+		}
+	} else if deleteType == "season" {
+		for _, id := range ids {
+			for _, series := range cachedSeries {
+				for _, season := range series.Seasons {
+					if season.SeasonId == id {
+						previewItems = append(previewItems, struct {
+							Name   string
+							SizeGB float64
+							Path   string
+						}{
+							Name:   fmt.Sprintf("%s - Season %d", series.Name, season.SeasonNumber),
+							SizeGB: season.SizeGB,
+							Path:   fmt.Sprintf("Season %d", season.SeasonNumber),
+						})
+						break
+					}
+				}
+			}
+		}
+	}
+	cacheMutex.RUnlock()
+
+	data := struct {
+		Type  string
+		Ids   string
+		Items []struct {
+			Name   string
+			SizeGB float64
+			Path   string
+		}
+	}{
+		Type:  deleteType,
+		Ids:   idsParam,
+		Items: previewItems,
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := deletePreviewTmpl.Execute(w, data); err != nil {
+		fmt.Printf("Template error: %v\n", err)
+		http.Error(w, "Template error", http.StatusInternalServerError)
+	}
+}
+
+func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
+	var deleteType, idsParam string
+	dryRun := false
+
+	// Check for global dry-run mode via environment variable
+	// If set, force dry-run mode regardless of request parameters
+	envDryRun := os.Getenv("DRY_RUN_MODE")
+	if envDryRun == "true" || envDryRun == "1" || strings.ToLower(envDryRun) == "yes" {
+		dryRun = true
+		fmt.Printf("watched-cleanup: DRY_RUN_MODE environment variable is enabled - all deletions will be in test mode\n")
+	}
+
+	// Support both GET (query params) and POST (form/JSON)
+	if r.Method == "POST" {
+		if r.Header.Get("Content-Type") == "application/json" {
+			var req struct {
+				Type   string `json:"type"`
+				Ids    string `json:"ids"`
+				DryRun bool   `json:"dryRun"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+				deleteType = req.Type
+				idsParam = req.Ids
+				// Only use request dryRun if env var is not set
+				if envDryRun == "" {
+					dryRun = req.DryRun
+				}
+			}
+		} else {
+			// Form data
+			deleteType = r.FormValue("type")
+			idsParam = r.FormValue("ids")
+			// Only use request dryRun if env var is not set
+			if envDryRun == "" {
+				dryRun = r.FormValue("dryRun") == "true" || r.FormValue("test") == "true"
+			}
+		}
+	} else {
+		// GET request
+		deleteType = r.URL.Query().Get("type")
+		idsParam = r.URL.Query().Get("ids")
+		// Only use request dryRun if env var is not set
+		if envDryRun == "" {
+			dryRun = r.URL.Query().Get("dryRun") == "true" || r.URL.Query().Get("test") == "true"
+		}
+	}
+
+	if deleteType == "" || idsParam == "" {
+		http.Error(w, "Missing type or ids", http.StatusBadRequest)
+		return
+	}
+
+	ids := splitIDs(idsParam)
+
+	if len(ids) == 0 {
+		http.Error(w, "No IDs provided", http.StatusBadRequest)
+		return
+	}
+
+	// Start delete operation in background
+	deleteMutex.Lock()
+	if isDeleting {
+		deleteMutex.Unlock()
+		http.Error(w, "Delete already in progress", http.StatusConflict)
+		return
+	}
+	isDeleting = true
+	message := "Starting deletion..."
+	if dryRun {
+		message = "Starting TEST MODE (dry-run) - no files will be deleted..."
+	}
+	deleteProgress = models.DeleteProgress{
+		Total:             len(ids),
+		Current:           0,
+		Message:           message,
+		Percent:           0,
+		StageJellyfin:     "pending",
+		StageInode:        "pending",
+		StageRadarrSonarr: "pending",
+		EpisodeCurrent:    0,
+		EpisodeTotal:      0,
+		StageErrors:       []string{},
+	}
+	deleteResult = models.DeleteResult{
+		Items:      []models.DeletedItem{},
+		Errors:     []string{},
+		TotalSizeGB: 0,
+		DryRun:     dryRun,
+	}
+	deleteMutex.Unlock()
+
+	// Show progress modal immediately
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, deleteProgress)
+
+	// Start deletion in background
+	go deletion.PerformDelete(httpClient, ids, deleteType, dryRun, &deleteProgress, &deleteResult, &cacheMutex, &cachedMovies, &cachedSeries, &deleteMutex, &isDeleting)
+}
+
+func handleDeleteProgress(w http.ResponseWriter, r *http.Request) {
+	deleteMutex.RLock()
+	progress := deleteProgress
+	deleting := isDeleting
+	deleteMutex.RUnlock()
+
+	if !deleting {
+		// Deletion complete, show summary
+		deleteMutex.RLock()
+		result := deleteResult
+		deleteMutex.RUnlock()
+
+		w.Header().Set("Content-Type", "text/html")
+		deleteSummaryTmpl.Execute(w, result)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	deleteProgressTmpl.Execute(w, progress)
+}
+
+func splitIDs(idsParam string) []string {
+	ids := []string{}
+	for _, id := range strings.Split(idsParam, ",") {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func updateDeleteProgress(current, total int, message, currentItem string) {
+	deleteMutex.Lock()
+	deleteProgress.Current = current
+	deleteProgress.Total = total
+	deleteProgress.Message = message
+	deleteProgress.CurrentItem = currentItem
+	if total > 0 {
+		deleteProgress.Percent = int(float64(current) / float64(total) * 100)
+	} else {
+		deleteProgress.Percent = 0
+	}
+	deleteMutex.Unlock()
+}
+
+func updateDeleteProgressStages(stageJellyfin, stageInode, stageRadarrSonarr string, episodeCurrent, episodeTotal int, errors []string) {
+	deleteMutex.Lock()
+	deleteProgress.StageJellyfin = stageJellyfin
+	deleteProgress.StageInode = stageInode
+	deleteProgress.StageRadarrSonarr = stageRadarrSonarr
+	deleteProgress.EpisodeCurrent = episodeCurrent
+	deleteProgress.EpisodeTotal = episodeTotal
+	deleteProgress.StageErrors = errors
+	deleteMutex.Unlock()
+}
+
+func performDelete(ids []string, deleteType string, dryRun bool) {
+	mode := "deletion"
+	if dryRun {
+		mode = "TEST MODE (dry-run)"
+	}
+	fmt.Printf("watched-cleanup: Starting %s of %d %s(s)\n", mode, len(ids), deleteType)
+
+	defer func() {
+		deleteMutex.Lock()
+		isDeleting = false
+		deleteMutex.Unlock()
+		if dryRun {
+			fmt.Printf("watched-cleanup: Test mode completed - no files were actually deleted\n")
+		} else {
+			fmt.Printf("watched-cleanup: Deletion process completed\n")
+		}
+	}()
+
+	var globalErrors []string
+	var deletedItems []DeletedItem
+	var totalSizeGB float64
+
+	// Get hardlink search directory from env, default to /data/torrents for Docker
+	hardlinkSearchDir := os.Getenv("TORRENTS_PATH")
+	if hardlinkSearchDir == "" {
+		hardlinkSearchDir = "/data/torrents"
+	}
+	fmt.Printf("watched-cleanup: Using hardlink search directory: %s\n", hardlinkSearchDir)
+
+	for i, id := range ids {
+		var filesToCheck []string
+		var itemName string
+		var itemSizeGB float64
+		var episodeTotal int
+		var episodeInodeComplete int
+		var stageErrors []string
+
+		// Initialize item tracking
+		currentItem := DeletedItem{
+			Type:             deleteType,
+			HardlinksDeleted: []string{},
+			Errors:           []string{},
+			StageResults: StageResults{
+				Inode:        StageResult{Status: "pending"},
+				RadarrSonarr: StageResult{Status: "pending"},
+				Jellyfin:     StageResult{Status: "pending"},
+			},
+		}
+
+		// Handle different types differently
+		if deleteType == "season" {
+			modePrefix := ""
+			if dryRun {
+				modePrefix = "[TEST] "
+			}
+			fmt.Printf("watched-cleanup: Processing season %d/%d (ID: %s)\n", i+1, len(ids), id)
+			updateDeleteProgress(i+1, len(ids), fmt.Sprintf("%sProcessing season %d of %d", modePrefix, i+1, len(ids)), "")
+			updateDeleteProgressStages("pending", "pending", "pending", 0, 0, []string{})
+
+			seasonEpisodesBody, err := fetchAPI("season_episodes", id)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error fetching season episodes: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				updateDeleteProgressStages("error", "pending", "pending", 0, 0, []string{errMsg})
+				continue
+			}
+
+			var seasonEpisodes EpisodeList
+			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+				errMsg := fmt.Sprintf("Error parsing season episodes: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				updateDeleteProgressStages("error", "pending", "pending", 0, 0, []string{errMsg})
+				continue
+			}
+
+			fmt.Printf("watched-cleanup: Found %d episodes in season\n", len(seasonEpisodes.Items))
+
+			// Get season name and size
+			cacheMutex.RLock()
+			for _, series := range cachedSeries {
+				for _, season := range series.Seasons {
+					if season.SeasonId == id {
+						itemName = fmt.Sprintf("%s - Season %d", series.Name, season.SeasonNumber)
+						itemSizeGB = season.SizeGB
+						break
+					}
+				}
+			}
+			cacheMutex.RUnlock()
+			fmt.Printf("watched-cleanup: Season name: %s (%.2f GB)\n", itemName, itemSizeGB)
+
+			// Initialize episode tracking
+			episodeTotal = len(seasonEpisodes.Items)
+			episodeInodeComplete = 0
+			stageErrors = []string{}
+
+			// Collect all episode files first
+			for _, ep := range seasonEpisodes.Items {
+				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
+				if err != nil {
+					fmt.Printf("watched-cleanup: Error fetching episode %s: %v\n", ep.Id, err)
+					continue
+				}
+				var details MovieDetails
+				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+					fmt.Printf("watched-cleanup: Error parsing episode %s: %v\n", ep.Id, err)
+					continue
+				}
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("watched-cleanup: Episode file: %s\n", filepath.Base(path))
+					}
+				}
+			}
+
+			// Process each episode through all 3 stages
+			updateDeleteProgressStages("pending", "processing", "pending", 0, episodeTotal, []string{})
+		} else if deleteType == "movie" {
+			modePrefix := ""
+			if dryRun {
+				modePrefix = "[TEST] "
+			}
+			episodeTotal = 0
+			stageErrors = []string{}
+			fmt.Printf("watched-cleanup: Processing movie %d/%d (ID: %s)\n", i+1, len(ids), id)
+			updateDeleteProgress(i+1, len(ids), fmt.Sprintf("%sProcessing movie %d of %d", modePrefix, i+1, len(ids)), "")
+			updateDeleteProgressStages("pending", "pending", "pending", 0, 0, []string{})
+
+			detailsBody, err := fetchAPI("movie_details", id)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error fetching movie details: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				continue
+			}
+
+			var details MovieDetails
+			if err := json.Unmarshal(detailsBody, &details); err != nil {
+				errMsg := fmt.Sprintf("Error parsing movie details: %v", err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				continue
+			}
+
+			if len(details.MediaSources) > 0 {
+				path := details.MediaSources[0].Path
+				if path != "" {
+					filesToCheck = append(filesToCheck, path)
+					fmt.Printf("watched-cleanup: Movie file: %s\n", path)
+				}
+
+				// Get movie name and size
+				cacheMutex.RLock()
+				for _, movie := range cachedMovies.Items {
+					if movie.Id == id {
+						itemName = movie.Name
+						itemSizeGB = movie.SizeGB
+						break
+					}
+				}
+				cacheMutex.RUnlock()
+				fmt.Printf("watched-cleanup: Movie name: %s (%.2f GB)\n", itemName, itemSizeGB)
+			}
+		}
+
+		// Find and delete hardlinks - Stage 1: Inode/Hardlink matching
+		currentItem.StageResults.Inode.Status = "processing"
+		currentItem.StageResults.Inode.Details = []string{}
+		filesDeleted := 0
+
+		if len(filesToCheck) > 0 {
+			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
+			episodeIndex := 0
+			for _, filePath := range filesToCheck {
+				if deleteType == "season" {
+					episodeIndex++
+					updateDeleteProgressStages("pending", "processing", "pending", episodeIndex, episodeTotal, stageErrors)
+					updateDeleteProgress(i+1, len(ids), fmt.Sprintf("Stage 1: Processing episode %d/%d - Inode/Hardlink", episodeIndex, episodeTotal), filepath.Base(filePath))
+				} else {
+					progressMsg := fmt.Sprintf("Stage 1: Deleting files for %s", itemName)
+					if dryRun {
+						progressMsg = fmt.Sprintf("[TEST] Stage 1: Would delete files for %s", itemName)
+					}
+					updateDeleteProgress(i+1, len(ids), progressMsg, filepath.Base(filePath))
+					updateDeleteProgressStages("pending", "processing", "pending", 0, 0, []string{})
+				}
+				fmt.Printf("watched-cleanup: Processing file: %s\n", filePath)
+
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					fmt.Printf("watched-cleanup: File doesn't exist (already deleted?): %s\n", filePath)
+					continue
+				}
+
+				// Check if hardlink search directory exists
+				if _, err := os.Stat(hardlinkSearchDir); os.IsNotExist(err) {
+					fmt.Printf("watched-cleanup: Hardlink search directory doesn't exist, skipping hardlink check: %s\n", hardlinkSearchDir)
+				} else {
+					hardlinks, err := findHardlinks(filePath, hardlinkSearchDir)
+					if err != nil {
+						errMsg := fmt.Sprintf("Error finding hardlinks for %s: %v", filePath, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+					} else {
+						if len(hardlinks) > 0 {
+							fmt.Printf("watched-cleanup: Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
+							for _, link := range hardlinks {
+								if dryRun {
+									fmt.Printf("watched-cleanup: [DRY-RUN] Would delete hardlink: %s\n", link)
+									currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
+								} else {
+									fmt.Printf("watched-cleanup: Deleting hardlink: %s\n", link)
+									if err := os.Remove(link); err != nil {
+										errMsg := fmt.Sprintf("Error deleting hardlink %s: %v", link, err)
+										fmt.Printf("watched-cleanup: %s\n", errMsg)
+										currentItem.Errors = append(currentItem.Errors, errMsg)
+										globalErrors = append(globalErrors, errMsg)
+									} else {
+										currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
+										fmt.Printf("watched-cleanup: Successfully deleted hardlink: %s\n", link)
+									}
+								}
+							}
+						} else {
+							fmt.Printf("watched-cleanup: No hardlinks found for %s\n", filepath.Base(filePath))
+						}
+					}
+				}
+
+				// Delete the original file
+				if dryRun {
+					fmt.Printf("watched-cleanup: [DRY-RUN] Would delete original file: %s\n", filePath)
+					filesDeleted++
+				} else {
+					fmt.Printf("watched-cleanup: Deleting original file: %s\n", filePath)
+					if err := os.Remove(filePath); err != nil {
+						errMsg := fmt.Sprintf("Error deleting %s: %v", filePath, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+					} else {
+						fmt.Printf("watched-cleanup: Successfully deleted file: %s\n", filePath)
+						filesDeleted++
+					}
+				}
+				// Mark episode as complete for inode stage (for seasons)
+				if deleteType == "season" {
+					episodeInodeComplete++
+				}
+			}
+			currentItem.FilesDeleted = filesDeleted
+			// Mark inode stage as complete after processing all files
+			if deleteType == "season" {
+				if episodeInodeComplete == episodeTotal {
+					updateDeleteProgressStages("pending", "complete", "pending", episodeInodeComplete, episodeTotal, stageErrors)
+					currentItem.StageResults.Inode.Status = "success"
+					currentItem.StageResults.Inode.Message = fmt.Sprintf("Deleted %d files and %d hardlinks", filesDeleted, len(currentItem.HardlinksDeleted))
+				} else {
+					errMsg := fmt.Sprintf("Inode stage: Only %d/%d episodes completed", episodeInodeComplete, episodeTotal)
+					stageErrors = append(stageErrors, errMsg)
+					currentItem.Errors = append(currentItem.Errors, errMsg)
+					updateDeleteProgressStages("pending", "error", "pending", episodeInodeComplete, episodeTotal, stageErrors)
+					currentItem.StageResults.Inode.Status = "error"
+					currentItem.StageResults.Inode.Message = errMsg
+				}
+			} else {
+				// For movies, mark inode stage complete
+				updateDeleteProgressStages("pending", "complete", "pending", 0, 0, []string{})
+				currentItem.StageResults.Inode.Status = "success"
+				currentItem.StageResults.Inode.Message = fmt.Sprintf("Deleted %d files and %d hardlinks", filesDeleted, len(currentItem.HardlinksDeleted))
+			}
+		} else {
+			fmt.Printf("watched-cleanup: No files to delete for %s\n", itemName)
+			if deleteType == "season" {
+				updateDeleteProgressStages("pending", "error", "pending", 0, episodeTotal, []string{"No files found to delete"})
+			} else {
+				updateDeleteProgressStages("pending", "error", "pending", 0, 0, []string{"No files found to delete"})
+			}
+			currentItem.StageResults.Inode.Status = "error"
+			currentItem.StageResults.Inode.Message = "No files found to delete"
+		}
+
+		// Stage 2: Unmonitor in Sonarr/Radarr before deleting from Jellyfin
+		currentItem.StageResults.RadarrSonarr.Status = "processing"
+		updateDeleteProgressStages("pending", deleteProgress.StageInode, "processing", deleteProgress.EpisodeCurrent, deleteProgress.EpisodeTotal, deleteProgress.StageErrors)
+		if deleteType == "movie" {
+			fmt.Printf("watched-cleanup: Attempting to unmonitor movie in Radarr: %s\n", itemName)
+			progressMsg := fmt.Sprintf("Stage 2: Unmonitoring in Radarr: %s", itemName)
+			if dryRun {
+				progressMsg = fmt.Sprintf("[TEST] Stage 2: Would unmonitor in Radarr: %s", itemName)
+			}
+			updateDeleteProgress(i+1, len(ids), progressMsg, "")
+
+			var radarrMovie *RadarrMovie
+			var err error
+
+			// Try file path search first
+			if len(filesToCheck) > 0 {
+				radarrMovie, err = searchRadarrByPath(filesToCheck[0])
+				if err != nil {
+					fmt.Printf("watched-cleanup: Radarr path search failed: %v, trying title search\n", err)
+				}
+			}
+
+			// Fallback to title/year search
+			if radarrMovie == nil {
+				cacheMutex.RLock()
+				var movieYear int
+				for _, movie := range cachedMovies.Items {
+					if movie.Id == id {
+						movieYear = movie.ProductionYear
+						break
+					}
+				}
+				cacheMutex.RUnlock()
+
+				if itemName != "" && movieYear > 0 {
+					radarrMovie, err = searchRadarrByTitle(itemName, movieYear)
+					if err != nil {
+						fmt.Printf("watched-cleanup: Radarr title search failed: %v\n", err)
+					}
+				}
+			}
+
+			if radarrMovie != nil {
+				if dryRun {
+					fmt.Printf("watched-cleanup: [DRY-RUN] Would unmonitor movie %s (ID: %d) in Radarr\n", itemName, radarrMovie.Id)
+					currentItem.StageResults.RadarrSonarr.Status = "success"
+					currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Would unmonitor in Radarr (ID: %d)", radarrMovie.Id)
+					updateDeleteProgressStages("pending", deleteProgress.StageInode, "complete", 0, 0, []string{})
+				} else {
+					if err := unmonitorRadarrMovie(radarrMovie.Id); err != nil {
+						errMsg := fmt.Sprintf("Failed to unmonitor movie %s in Radarr: %v", itemName, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+						stageErrors = append(stageErrors, errMsg)
+						currentItem.StageResults.RadarrSonarr.Status = "error"
+						currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Failed to unmonitor in Radarr")
+						updateDeleteProgressStages("pending", deleteProgress.StageInode, "error", 0, 0, stageErrors)
+					} else {
+						fmt.Printf("watched-cleanup: Successfully unmonitored movie %s in Radarr\n", itemName)
+						currentItem.StageResults.RadarrSonarr.Status = "success"
+						currentItem.StageResults.RadarrSonarr.Message = "Successfully unmonitored in Radarr"
+						updateDeleteProgressStages("pending", deleteProgress.StageInode, "complete", 0, 0, []string{})
+					}
+				}
+			} else {
+				errMsg := fmt.Sprintf("Movie %s not found in Radarr", itemName)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				currentItem.Errors = append(currentItem.Errors, errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				stageErrors = append(stageErrors, errMsg)
+				currentItem.StageResults.RadarrSonarr.Status = "error"
+				currentItem.StageResults.RadarrSonarr.Message = "Not found in Radarr"
+				updateDeleteProgressStages("pending", deleteProgress.StageInode, "error", 0, 0, stageErrors)
+			}
+		} else if deleteType == "season" {
+			fmt.Printf("watched-cleanup: Attempting to unmonitor season in Sonarr: %s\n", itemName)
+			progressMsg := fmt.Sprintf("Stage 2: Unmonitoring in Sonarr: %s", itemName)
+			if dryRun {
+				progressMsg = fmt.Sprintf("[TEST] Stage 2: Would unmonitor in Sonarr: %s", itemName)
+			}
+			updateDeleteProgress(i+1, len(ids), progressMsg, "")
+
+			var sonarrSeries *SonarrSeries
+			var seasonNumber int
+			var err error
+
+			// Try file path search first
+			if len(filesToCheck) > 0 {
+				sonarrSeries, seasonNumber, err = searchSonarrByPath(filesToCheck[0])
+				if err != nil {
+					fmt.Printf("watched-cleanup: Sonarr path search failed: %v, trying title search\n", err)
+				}
+			}
+
+			// Fallback to title/season search
+			if sonarrSeries == nil {
+				cacheMutex.RLock()
+				var seriesName string
+				var foundSeasonNumber int
+				for _, series := range cachedSeries {
+					for _, season := range series.Seasons {
+						if season.SeasonId == id {
+							seriesName = series.Name
+							foundSeasonNumber = season.SeasonNumber
+							break
+						}
+					}
+					if seriesName != "" {
+						break
+					}
+				}
+				cacheMutex.RUnlock()
+
+				if seriesName != "" {
+					sonarrSeries, err = searchSonarrByTitle(seriesName, foundSeasonNumber)
+					if err != nil {
+						fmt.Printf("watched-cleanup: Sonarr title search failed: %v\n", err)
+					} else {
+						seasonNumber = foundSeasonNumber
+					}
+				}
+			}
+
+			if sonarrSeries != nil {
+				if dryRun {
+					fmt.Printf("watched-cleanup: [DRY-RUN] Would unmonitor season %s (Series ID: %d, Season: %d) in Sonarr\n", itemName, sonarrSeries.Id, seasonNumber)
+					currentItem.StageResults.RadarrSonarr.Status = "success"
+					currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Would unmonitor in Sonarr (ID: %d, Season: %d)", sonarrSeries.Id, seasonNumber)
+					updateDeleteProgressStages("pending", deleteProgress.StageInode, "complete", episodeTotal, episodeTotal, []string{})
+				} else {
+					if err := unmonitorSonarrSeason(sonarrSeries.Id, seasonNumber); err != nil {
+						errMsg := fmt.Sprintf("Failed to unmonitor season %s in Sonarr: %v", itemName, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+						stageErrors = append(stageErrors, errMsg)
+						currentItem.StageResults.RadarrSonarr.Status = "error"
+						currentItem.StageResults.RadarrSonarr.Message = "Failed to unmonitor in Sonarr"
+						updateDeleteProgressStages("pending", deleteProgress.StageInode, "error", episodeTotal, episodeTotal, stageErrors)
+					} else {
+						fmt.Printf("watched-cleanup: Successfully unmonitored season %s in Sonarr\n", itemName)
+						currentItem.StageResults.RadarrSonarr.Status = "success"
+						currentItem.StageResults.RadarrSonarr.Message = "Successfully unmonitored in Sonarr"
+						updateDeleteProgressStages("pending", deleteProgress.StageInode, "complete", episodeTotal, episodeTotal, []string{})
+					}
+				}
+			} else {
+				errMsg := fmt.Sprintf("Season %s not found in Sonarr", itemName)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				currentItem.Errors = append(currentItem.Errors, errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				stageErrors = append(stageErrors, errMsg)
+				currentItem.StageResults.RadarrSonarr.Status = "error"
+				currentItem.StageResults.RadarrSonarr.Message = "Not found in Sonarr"
+				updateDeleteProgressStages("pending", deleteProgress.StageInode, "error", episodeTotal, episodeTotal, stageErrors)
+			}
+		}
+
+		// Stage 3: Delete from Jellyfin
+		currentItem.StageResults.Jellyfin.Status = "processing"
+		updateDeleteProgressStages("processing", deleteProgress.StageInode, deleteProgress.StageRadarrSonarr, deleteProgress.EpisodeCurrent, deleteProgress.EpisodeTotal, deleteProgress.StageErrors)
+		if dryRun {
+			fmt.Printf("watched-cleanup: [DRY-RUN] Would delete from Jellyfin database: %s (%s)\n", id, itemName)
+			progressMsg := fmt.Sprintf("[TEST] Stage 3: Would remove from Jellyfin: %s", itemName)
+			if deleteType == "season" {
+				progressMsg = fmt.Sprintf("[TEST] Stage 3: Would remove from Jellyfin: %s (%d/%d episodes)", itemName, episodeTotal, episodeTotal)
+			}
+			updateDeleteProgress(i+1, len(ids), progressMsg, "")
+			currentItem.StageResults.Jellyfin.Status = "success"
+			currentItem.StageResults.Jellyfin.Message = "Would remove from Jellyfin"
+			updateDeleteProgressStages("complete", deleteProgress.StageInode, deleteProgress.StageRadarrSonarr, episodeTotal, episodeTotal, []string{})
+		} else {
+			fmt.Printf("watched-cleanup: Deleting from Jellyfin database: %s (%s)\n", id, itemName)
+			progressMsg := fmt.Sprintf("Stage 3: Removing from Jellyfin: %s", itemName)
+			if deleteType == "season" {
+				progressMsg = fmt.Sprintf("Stage 3: Removing from Jellyfin: %s (%d/%d episodes)", itemName, episodeTotal, episodeTotal)
+			}
+			updateDeleteProgress(i+1, len(ids), progressMsg, "")
+			callJellyfinDelete(id)
+			fmt.Printf("watched-cleanup: Jellyfin delete request sent for: %s\n", id)
+			currentItem.StageResults.Jellyfin.Status = "success"
+			currentItem.StageResults.Jellyfin.Message = "Removed from Jellyfin"
+			updateDeleteProgressStages("complete", deleteProgress.StageInode, deleteProgress.StageRadarrSonarr, episodeTotal, episodeTotal, []string{})
+		}
+
+		// Finalize item tracking
+		currentItem.Name = itemName
+		currentItem.SizeGB = itemSizeGB
+		totalSizeGB += itemSizeGB
+		deletedItems = append(deletedItems, currentItem)
+	}
+
+	// Update final result
+	summaryType := "Deletion"
+	if dryRun {
+		summaryType = "TEST MODE (Dry-Run) - No files were actually deleted"
+	}
+
+	// Calculate total hardlinks
+	totalHardlinks := 0
+	for _, item := range deletedItems {
+		totalHardlinks += len(item.HardlinksDeleted)
+	}
+
+	fmt.Printf("watched-cleanup: %s summary:\n", summaryType)
+	if dryRun {
+		fmt.Printf("watched-cleanup:   - Items that would be deleted: %d\n", len(ids))
+		fmt.Printf("watched-cleanup:   - Hardlinks that would be deleted: %d\n", totalHardlinks)
+		fmt.Printf("watched-cleanup:   - Total size: %.2f GB\n", totalSizeGB)
+	} else {
+		fmt.Printf("watched-cleanup:   - Items deleted: %d\n", len(ids))
+		fmt.Printf("watched-cleanup:   - Hardlinks deleted: %d\n", totalHardlinks)
+		fmt.Printf("watched-cleanup:   - Total size: %.2f GB\n", totalSizeGB)
+	}
+	fmt.Printf("watched-cleanup:   - Errors: %d\n", len(globalErrors))
+	if len(globalErrors) > 0 {
+		for _, err := range globalErrors {
+			fmt.Printf("watched-cleanup:     * %s\n", err)
+		}
+	}
+
+	deleteMutex.Lock()
+	deleteResult = DeleteResult{
+		DeletedCount:     len(ids),
+		DeletedHardlinks: totalHardlinks,
+		Errors:           globalErrors,
+		TotalSizeGB:      totalSizeGB,
+		DryRun:           dryRun,
+		Items:            deletedItems,
+	}
+	deleteMutex.Unlock()
+}
+func callJellyfinDelete(id string) {
+	baseurl := os.Getenv("JELLYFIN_BASE_URL")
+	token := os.Getenv("JELLYFIN_API_KEY")
+	url := fmt.Sprintf("%sItems/%s", baseurl, id)
+
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		fmt.Printf("watched-cleanup: Error creating Jellyfin delete request: %v\n", err)
+		return
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		fmt.Printf("watched-cleanup: Error sending Jellyfin delete request: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		fmt.Printf("watched-cleanup: Jellyfin delete successful (HTTP %d)\n", resp.StatusCode)
+	} else {
+		fmt.Printf("watched-cleanup: Jellyfin delete returned HTTP %d\n", resp.StatusCode)
+	}
+}
+
+// Radarr API functions
+// NOTE: Radarr API v3 does not support query parameters on GET /api/v3/movie
+// We must fetch all movies and filter client-side. This is the documented behavior.
+// Reference: https://radarr.video/docs/api/
+func searchRadarrByPath(filePath string) (*RadarrMovie, error) {
+	baseurl := os.Getenv("RADARR_BASE_URL")
+	apiKey := os.Getenv("RADARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return nil, fmt.Errorf("Radarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// Get all movies - API does not support filtering by path
+	// Must fetch all and check movie files for path match
+	url := fmt.Sprintf("%sapi/v3/movie", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Radarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	var movies []RadarrMovie
+	if err := json.NewDecoder(resp.Body).Decode(&movies); err != nil {
+		return nil, err
+	}
+
+	// Search for movie with matching file path
+	for _, movie := range movies {
+		// Get movie files to check paths
+		movieFilesUrl := fmt.Sprintf("%sapi/v3/moviefile?movieId=%d", baseurl, movie.Id)
+		movieFilesReq, err := http.NewRequest("GET", movieFilesUrl, nil)
+		if err != nil {
+			fmt.Printf("watched-cleanup: Error creating Radarr movie files request for movie %d: %v\n", movie.Id, err)
+			continue
+		}
+		movieFilesReq.Header.Set("X-Api-Key", apiKey)
+		movieFilesResp, err := httpClient.Do(movieFilesReq)
+		if err != nil {
+			fmt.Printf("watched-cleanup: Error fetching Radarr movie files for movie %d: %v\n", movie.Id, err)
+			continue
+		}
+
+		var movieFiles []RadarrMovieFile
+		if err := json.NewDecoder(movieFilesResp.Body).Decode(&movieFiles); err != nil {
+			movieFilesResp.Body.Close()
+			fmt.Printf("watched-cleanup: Error decoding Radarr movie files for movie %d: %v\n", movie.Id, err)
+			continue
+		}
+		movieFilesResp.Body.Close()
+
+		// Check if any movie file path matches
+		// Normalize paths for comparison (handle case, trailing slashes, etc.)
+		normalizedFilePath := filepath.Clean(filePath)
+		for _, mf := range movieFiles {
+			normalizedMoviePath := filepath.Clean(mf.Path)
+			if normalizedMoviePath == normalizedFilePath {
+				return &movie, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("movie not found in Radarr by path")
+}
+
+func searchRadarrByTitle(title string, year int) (*RadarrMovie, error) {
+	baseurl := os.Getenv("RADARR_BASE_URL")
+	apiKey := os.Getenv("RADARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return nil, fmt.Errorf("Radarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// NOTE: Radarr API v3 GET /api/v3/movie does not support query parameters for filtering
+	// Must fetch all movies and filter client-side by title and year
+	// Reference: https://radarr.video/docs/api/
+	url := fmt.Sprintf("%sapi/v3/movie", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Radarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	var movies []RadarrMovie
+	if err := json.NewDecoder(resp.Body).Decode(&movies); err != nil {
+		return nil, err
+	}
+
+	// Find exact match by title and year
+	for i := range movies {
+		if strings.EqualFold(movies[i].Title, title) && movies[i].Year == year {
+			return &movies[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("movie not found in Radarr by title and year")
+}
+
+func unmonitorRadarrMovie(movieId int) error {
+	baseurl := os.Getenv("RADARR_BASE_URL")
+	apiKey := os.Getenv("RADARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return fmt.Errorf("Radarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// Get current movie data
+	url := fmt.Sprintf("%sapi/v3/movie/%d", baseurl, movieId)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Radarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	// Read the full JSON response to preserve all fields
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Parse into a map to preserve all fields, then update monitored
+	var movieData map[string]interface{}
+	if err := json.Unmarshal(body, &movieData); err != nil {
+		return err
+	}
+
+	// Update monitored status
+	movieData["monitored"] = false
+
+	// Update movie
+	updateUrl := fmt.Sprintf("%sapi/v3/movie/%d", baseurl, movieId)
+	jsonData, err := json.Marshal(movieData)
+	if err != nil {
+		return err
+	}
+
+	updateReq, err := http.NewRequest("PUT", updateUrl, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return err
+	}
+	updateReq.Header.Set("X-Api-Key", apiKey)
+	updateReq.Header.Set("Content-Type", "application/json")
+
+	updateResp, err := httpClient.Do(updateReq)
+	if err != nil {
+		return err
+	}
+	defer updateResp.Body.Close()
+
+	if updateResp.StatusCode >= 200 && updateResp.StatusCode < 300 {
+		fmt.Printf("watched-cleanup: Successfully unmonitored movie %d in Radarr\n", movieId)
+		return nil
+	}
+
+	return fmt.Errorf("Radarr unmonitor returned HTTP %d", updateResp.StatusCode)
+}
+
+// Sonarr API functions
+// NOTE: Sonarr API v3 does not support query parameters on GET /api/v3/series
+// We must fetch all series and filter client-side. This is the documented behavior.
+// Reference: https://wiki.servarr.com/sonarr/api
+func searchSonarrByPath(filePath string) (*SonarrSeries, int, error) {
+	baseurl := os.Getenv("SONARR_BASE_URL")
+	apiKey := os.Getenv("SONARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return nil, 0, fmt.Errorf("Sonarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// Get all series - API does not support filtering by path
+	// Must fetch all and check episode files for path match
+	url := fmt.Sprintf("%sapi/v3/series", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, 0, fmt.Errorf("Sonarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	var seriesList []SonarrSeries
+	if err := json.NewDecoder(resp.Body).Decode(&seriesList); err != nil {
+		return nil, 0, err
+	}
+
+	// Search for episode file matching the path
+	for _, series := range seriesList {
+		// Get episode files for this series
+		episodeFilesUrl := fmt.Sprintf("%sapi/v3/episodefile?seriesId=%d", baseurl, series.Id)
+		episodeFilesReq, err := http.NewRequest("GET", episodeFilesUrl, nil)
+		if err != nil {
+			fmt.Printf("watched-cleanup: Error creating Sonarr episode files request for series %d: %v\n", series.Id, err)
+			continue
+		}
+		episodeFilesReq.Header.Set("X-Api-Key", apiKey)
+		episodeFilesResp, err := httpClient.Do(episodeFilesReq)
+		if err != nil {
+			fmt.Printf("watched-cleanup: Error fetching Sonarr episode files for series %d: %v\n", series.Id, err)
+			continue
+		}
+
+		var episodeFiles []SonarrEpisodeFile
+		if err := json.NewDecoder(episodeFilesResp.Body).Decode(&episodeFiles); err != nil {
+			episodeFilesResp.Body.Close()
+			fmt.Printf("watched-cleanup: Error decoding Sonarr episode files for series %d: %v\n", series.Id, err)
+			continue
+		}
+		episodeFilesResp.Body.Close()
+
+		// Check if any episode file path matches
+		// Normalize paths for comparison (handle case, trailing slashes, etc.)
+		normalizedFilePath := filepath.Clean(filePath)
+		for _, ef := range episodeFiles {
+			normalizedEpisodePath := filepath.Clean(ef.Path)
+			if normalizedEpisodePath == normalizedFilePath {
+				// Get full series data with seasons
+				seriesUrl := fmt.Sprintf("%sapi/v3/series/%d", baseurl, series.Id)
+				seriesReq, err := http.NewRequest("GET", seriesUrl, nil)
+				if err != nil {
+					fmt.Printf("watched-cleanup: Error creating Sonarr series request for series %d: %v\n", series.Id, err)
+					continue
+				}
+				seriesReq.Header.Set("X-Api-Key", apiKey)
+				seriesResp, err := httpClient.Do(seriesReq)
+				if err != nil {
+					fmt.Printf("watched-cleanup: Error fetching Sonarr series %d: %v\n", series.Id, err)
+					continue
+				}
+
+				var fullSeries SonarrSeries
+				if err := json.NewDecoder(seriesResp.Body).Decode(&fullSeries); err != nil {
+					seriesResp.Body.Close()
+					fmt.Printf("watched-cleanup: Error decoding Sonarr series %d: %v\n", series.Id, err)
+					continue
+				}
+				seriesResp.Body.Close()
+
+				return &fullSeries, ef.SeasonNumber, nil
+			}
+		}
+	}
+
+	return nil, 0, fmt.Errorf("series not found in Sonarr by path")
+}
+
+func searchSonarrByTitle(title string, seasonNumber int) (*SonarrSeries, error) {
+	baseurl := os.Getenv("SONARR_BASE_URL")
+	apiKey := os.Getenv("SONARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return nil, fmt.Errorf("Sonarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// NOTE: Sonarr API v3 GET /api/v3/series does not support query parameters for filtering
+	// Must fetch all series and filter client-side by title
+	// Reference: https://wiki.servarr.com/sonarr/api
+	url := fmt.Sprintf("%sapi/v3/series", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("Sonarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	var seriesList []SonarrSeries
+	if err := json.NewDecoder(resp.Body).Decode(&seriesList); err != nil {
+		return nil, err
+	}
+
+	// Find exact match by title
+	// Note: The series list from /api/v3/series already includes the seasons array,
+	// so we can return it directly without an extra fetch
+	for i := range seriesList {
+		if strings.EqualFold(seriesList[i].Title, title) {
+			return &seriesList[i], nil
+		}
+	}
+
+	return nil, fmt.Errorf("series not found in Sonarr by title")
+}
+
+func unmonitorSonarrSeason(seriesId int, seasonNumber int) error {
+	baseurl := os.Getenv("SONARR_BASE_URL")
+	apiKey := os.Getenv("SONARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		return fmt.Errorf("Sonarr not configured")
+	}
+
+	// Ensure baseurl ends with /
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	// Get current series data
+	url := fmt.Sprintf("%sapi/v3/series/%d", baseurl, seriesId)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Sonarr API returned HTTP %d", resp.StatusCode)
+	}
+
+	// Read the full JSON response to preserve all fields
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Parse into a map to preserve all fields, then update monitored for the season
+	var seriesData map[string]interface{}
+	if err := json.Unmarshal(body, &seriesData); err != nil {
+		return err
+	}
+
+	// Update monitored status for the specific season
+	seasons, ok := seriesData["seasons"].([]interface{})
+	if !ok {
+		return fmt.Errorf("seasons field not found or invalid in series %d", seriesId)
+	}
+
+	found := false
+	for _, seasonInterface := range seasons {
+		season, ok := seasonInterface.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		seasonNum, ok := season["seasonNumber"].(float64)
+		if !ok {
+			continue
+		}
+		if int(seasonNum) == seasonNumber {
+			season["monitored"] = false
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("season %d not found in series %d", seasonNumber, seriesId)
+	}
+
+	// Update series
+	updateUrl := fmt.Sprintf("%sapi/v3/series/%d", baseurl, seriesId)
+	jsonData, err := json.Marshal(seriesData)
+	if err != nil {
+		return err
+	}
+
+	updateReq, err := http.NewRequest("PUT", updateUrl, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return err
+	}
+	updateReq.Header.Set("X-Api-Key", apiKey)
+	updateReq.Header.Set("Content-Type", "application/json")
+
+	updateResp, err := httpClient.Do(updateReq)
+	if err != nil {
+		return err
+	}
+	defer updateResp.Body.Close()
+
+	if updateResp.StatusCode >= 200 && updateResp.StatusCode < 300 {
+		fmt.Printf("watched-cleanup: Successfully unmonitored season %d in series %d in Sonarr\n", seasonNumber, seriesId)
+		return nil
+	}
+
+	return fmt.Errorf("Sonarr unmonitor returned HTTP %d", updateResp.StatusCode)
+}
+
+// Add this function to find hardlinks by inode
+func findHardlinks(targetPath string, searchDir string) ([]string, error) {
+	// Get the inode of the target file
+	targetInfo, err := os.Stat(targetPath)
+	if err != nil {
+		return nil, err
+	}
+
+	targetStat, ok := targetInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, fmt.Errorf("failed to get stat info")
+	}
+	targetInode := targetStat.Ino
+
+	var matches []string
+
+	// Walk the search directory
+	err = filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors, continue walking
+		}
+
+		if info.IsDir() {
+			return nil // Skip directories
+		}
+
+		// Get inode of current file
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+
+		// If inodes match, this is a hardlink
+		if stat.Ino == targetInode {
+			matches = append(matches, path)
+		}
+
+		return nil
+	})
+
+	return matches, err
+}
+
+// Add this function to find all files in a directory recursively
+func getAllFilesInDir(dirPath string) ([]string, error) {
+	var files []string
+
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Skip errors
+		}
+
+		if !info.IsDir() {
+			files = append(files, path)
+		}
+
+		return nil
+	})
+
+	return files, err
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Ids  []string `json:"ids"`
+		Type string   `json:"type"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	var deletedHardlinks []string
+
+	for _, id := range req.Ids {
+		var filesToCheck []string
+
+		// Handle different types differently
+		if req.Type == "season" {
+			// For seasons, we need to get all episodes first
+			fmt.Printf("watched-cleanup: Fetching episodes for season %s\n", id)
+
+			seasonEpisodesBody, err := fetchAPI("season_episodes", id)
+			if err != nil {
+				fmt.Printf("  Error fetching season episodes: %v\n", err)
+				continue
+			}
+
+			var seasonEpisodes EpisodeList
+			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+				fmt.Printf("  Error unmarshaling season episodes: %v\n", err)
+				continue
+			}
+
+			fmt.Printf("  Found %d episodes in season\n", len(seasonEpisodes.Items))
+
+			// Get the path for each episode
+			for _, ep := range seasonEpisodes.Items {
+				episodeDetailsBody, err := fetchAPI("episode_details", ep.Id)
+				if err != nil {
+					continue
+				}
+				var details MovieDetails
+				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+					continue
+				}
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("    Episode file: %s\n", filepath.Base(path))
+					}
+				}
+			}
+		} else if req.Type == "movie" {
+			// For movies, get the single file path
+			detailsBody, err := fetchAPI("movie_details", id)
+			if err == nil {
+				var details MovieDetails
+				json.Unmarshal(detailsBody, &details)
+				if len(details.MediaSources) > 0 {
+					path := details.MediaSources[0].Path
+					if path != "" {
+						filesToCheck = append(filesToCheck, path)
+						fmt.Printf("watched-cleanup: Movie file: %s\n", path)
+					}
+				}
+			}
+		}
+
+		// 2. Find and delete hardlinks for all files
+		if len(filesToCheck) > 0 {
+			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
+
+			for _, filePath := range filesToCheck {
+				// Check if file exists
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					fmt.Printf("  File doesn't exist (already deleted?): %s\n", filePath)
+					continue
+				}
+
+				hardlinks, err := findHardlinks(filePath, "/data/torrents")
+				if err != nil {
+					fmt.Printf("  Error finding hardlinks for %s: %v\n", filePath, err)
+					continue
+				}
+
+				if len(hardlinks) > 0 {
+					fmt.Printf("  Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
+					for _, link := range hardlinks {
+						fmt.Printf("    Deleting hardlink: %s\n", link)
+						if err := os.Remove(link); err != nil {
+							fmt.Printf("    Error deleting %s: %v\n", link, err)
+						} else {
+							deletedHardlinks = append(deletedHardlinks, link)
+						}
+					}
+				} else {
+					fmt.Printf("  No hardlinks found for %s\n", filepath.Base(filePath))
+				}
+
+				// Delete the original file
+				fmt.Printf("  Deleting original file: %s\n", filePath)
+				if err := os.Remove(filePath); err != nil {
+					fmt.Printf("  Error deleting original: %v\n", err)
+				}
+			}
+		}
+
+		// 3. Tell Jellyfin to delete the item from its database
+		fmt.Printf("  Deleting from Jellyfin database: %s\n", id)
+		callJellyfinDelete(id)
+	}
+
+	responseMsg := fmt.Sprintf("Successfully deleted %d %s(s)", len(req.Ids), req.Type)
+	if len(deletedHardlinks) > 0 {
+		responseMsg += fmt.Sprintf(" and %d hardlinked torrent file(s)", len(deletedHardlinks))
+	}
+
+	fmt.Printf("watched-cleanup: Complete. %s\n", responseMsg)
+	w.Write([]byte(responseMsg))
+}
+
+// Test handlers for Radarr/Sonarr API
+func handleTestRadarrMovies(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	baseurl := os.Getenv("RADARR_BASE_URL")
+	apiKey := os.Getenv("RADARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		http.Error(w, `{"error": "Radarr not configured"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	url := fmt.Sprintf("%sapi/v3/movie", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to create request: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "API request failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to read response: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	// Pretty print JSON
+	var movies []RadarrMovie
+	if err := json.Unmarshal(body, &movies); err != nil {
+		w.Write(body)
+		return
+	}
+
+	prettyJSON, _ := json.MarshalIndent(map[string]interface{}{
+		"count":  len(movies),
+		"movies": movies,
+	}, "", "  ")
+	w.Write(prettyJSON)
+}
+
+func handleTestRadarrSearchPath(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, `{"error": "Missing 'path' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	movie, err := radarr.SearchByPath(httpClient, filePath)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"path":  filePath,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found": true,
+		"movie": movie,
+		"path":  filePath,
+	})
+}
+
+func handleTestRadarrSearchTitle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	title := r.URL.Query().Get("title")
+	yearStr := r.URL.Query().Get("year")
+	if title == "" {
+		http.Error(w, `{"error": "Missing 'title' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	year := 0
+	if yearStr != "" {
+		fmt.Sscanf(yearStr, "%d", &year)
+	}
+
+	movie, err := radarr.SearchByTitle(httpClient, title, year)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"title": title,
+			"year":  year,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found": true,
+		"movie": movie,
+		"title": title,
+		"year":  year,
+	})
+}
+
+func handleTestSonarrSeries(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	baseurl := os.Getenv("SONARR_BASE_URL")
+	apiKey := os.Getenv("SONARR_API_KEY")
+	if baseurl == "" || apiKey == "" {
+		http.Error(w, `{"error": "Sonarr not configured"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if !strings.HasSuffix(baseurl, "/") {
+		baseurl += "/"
+	}
+
+	url := fmt.Sprintf("%sapi/v3/series", baseurl)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to create request: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("X-Api-Key", apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "API request failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to read response: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	if resp.StatusCode != 200 {
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	// Pretty print JSON
+	var seriesList []SonarrSeries
+	if err := json.Unmarshal(body, &seriesList); err != nil {
+		w.Write(body)
+		return
+	}
+
+	prettyJSON, _ := json.MarshalIndent(map[string]interface{}{
+		"count":  len(seriesList),
+		"series": seriesList,
+	}, "", "  ")
+	w.Write(prettyJSON)
+}
+
+func handleTestSonarrSearchPath(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		http.Error(w, `{"error": "Missing 'path' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	series, seasonNumber, err := sonarr.SearchByPath(httpClient, filePath)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": err.Error(),
+			"path":  filePath,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":        true,
+		"series":       series,
+		"seasonNumber": seasonNumber,
+		"path":         filePath,
+	})
+}
+
+func handleTestSonarrSearchTitle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	title := r.URL.Query().Get("title")
+	if title == "" {
+		http.Error(w, `{"error": "Missing 'title' query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Season number is optional for title search
+	seasonNumber := 0
+	if seasonStr := r.URL.Query().Get("season"); seasonStr != "" {
+		fmt.Sscanf(seasonStr, "%d", &seasonNumber)
+	}
+
+	series, err := sonarr.SearchByTitle(httpClient, title, seasonNumber)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":        err.Error(),
+			"title":        title,
+			"seasonNumber": seasonNumber,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":        true,
+		"series":       series,
+		"title":        title,
+		"seasonNumber": seasonNumber,
+	})
+}
+
+func fetchMovieData() MovieList {
+	body, err := fetchAPI("played_movies", "")
+	if err != nil {
+		fmt.Println("Error fetching movies:", err)
+		return MovieList{}
+	}
+
+	var movieList MovieList
+	if err := json.Unmarshal(body, &movieList); err != nil {
+		fmt.Println("Error parsing movies:", err)
+		return MovieList{}
+	}
+
+	fmt.Println("Number of movies:", len(movieList.Items))
+
+	// Parallelize movie detail fetching
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // Limit to 10 concurrent requests
+	var mu sync.Mutex
+	var completed int32
+
+	for i := range movieList.Items {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}        // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			detailsBody, err := fetchAPI("movie_details", movieList.Items[idx].Id)
+			if err != nil {
+				atomic.AddInt32(&completed, 1)
+				return
+			}
+			var details MovieDetails
+			if err := json.Unmarshal(detailsBody, &details); err != nil {
+				atomic.AddInt32(&completed, 1)
+				return
+			}
+			mu.Lock()
+			if len(details.MediaSources) > 0 {
+				movieList.Items[idx].Size = details.MediaSources[0].Size
+				movieList.Items[idx].SizeGB = float64(details.MediaSources[0].Size) / (1024 * 1024 * 1024)
+				movieList.Items[idx].Path = details.MediaSources[0].Path
+			}
+			// Parse DateCreated from details (preferred) or initial list
+			dateStr := details.DateCreated
+			if dateStr == "" {
+				dateStr = movieList.Items[idx].DateCreated
+			}
+			if dateStr != "" {
+				if dateAdded, err := time.Parse("2006-01-02T15:04:05.0000000Z", dateStr); err == nil {
+					movieList.Items[idx].DateAdded = dateAdded
+				} else if dateAdded, err := time.Parse("2006-01-02T15:04:05Z", dateStr); err == nil {
+					movieList.Items[idx].DateAdded = dateAdded
+				} else if dateAdded, err := time.Parse("2006-01-02T15:04:05", dateStr); err == nil {
+					movieList.Items[idx].DateAdded = dateAdded
+				}
+			}
+			mu.Unlock()
+
+			current := atomic.AddInt32(&completed, 1)
+			updateProgress(int(current), len(movieList.Items), fmt.Sprintf("Fetching movie %d/%d", int(current), len(movieList.Items)))
+		}(i)
+	}
+
+	wg.Wait()
+	return movieList
+}
+
+func fetchTVData() []Series {
+	body, err := fetchAPI("watched_episodes", "")
+	if err != nil {
+		fmt.Println("Error fetching episodes:", err)
+		return nil
+	}
+
+	var episodeList EpisodeList
+	if err := json.Unmarshal(body, &episodeList); err != nil {
+		fmt.Println("Error parsing episodes:", err)
+		return nil
+	}
+
+	fmt.Println("Unmarshaled", len(episodeList.Items), "episodes")
+
+	grouped := make(map[string]*Series)
+
+	for _, ep := range episodeList.Items {
+		seriesId := ep.SeriesId
+		if grouped[seriesId] == nil {
+			// Fetch series details to get artwork
+			seriesBody, err := fetchAPI("series_details", seriesId)
+			if err == nil {
+				var seriesDetails struct {
+					ImageTags map[string]string `json:"ImageTags"`
+				}
+				json.Unmarshal(seriesBody, &seriesDetails)
+				grouped[seriesId] = &Series{
+					Name:      ep.SeriesName,
+					Id:        seriesId,
+					ImageTags: seriesDetails.ImageTags,
+				}
+			} else {
+				grouped[seriesId] = &Series{
+					Name:      ep.SeriesName,
+					Id:        seriesId,
+					ImageTags: make(map[string]string),
+				}
+			}
+			fmt.Println("New series:", ep.SeriesName)
+		}
+		seasonNum := ep.ParentIndexNumber
+		found := false
+		for i := range grouped[seriesId].Seasons {
+			if grouped[seriesId].Seasons[i].SeasonNumber == seasonNum {
+				grouped[seriesId].Seasons[i].WatchedCount++
+				found = true
+				break
+			}
+		}
+		if !found {
+			grouped[seriesId].Seasons = append(grouped[seriesId].Seasons, SeasonInfo{
+				SeasonNumber: seasonNum,
+				SeasonId:     ep.SeasonId,
+				WatchedCount: 1,
+			})
+			fmt.Printf("  New season %d for %s (SeasonId: %s)\n", seasonNum, ep.SeriesName, ep.SeasonId)
+		}
+	}
+
+	fmt.Println("Fetching season details for", len(grouped), "series...")
+
+	totalSeries := len(grouped)
+	var seriesCompleted int32
+
+	// Process each series
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, series := range grouped {
+		wg.Add(1)
+		go func(s *Series) {
+			defer wg.Done()
+
+			fmt.Println("Processing series:", s.Name, "with", len(s.Seasons), "seasons")
+
+			// Process seasons for this series
+			var seasonWg sync.WaitGroup
+			seasonSem := make(chan struct{}, 5) // Limit concurrent season fetches
+
+			for i := range s.Seasons {
+				seasonWg.Add(1)
+				go func(idx int) {
+					defer seasonWg.Done()
+					seasonSem <- struct{}{}
+					defer func() { <-seasonSem }()
+
+					fmt.Printf("  Fetching info for season %d (ID: %s)\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SeasonId)
+
+					seasonInfoBody, err := fetchAPI("season_info", s.Seasons[idx].SeasonId)
+					if err != nil {
+						fmt.Println("    Error fetching season info:", err)
+						return
+					}
+					var seasonInfo SeasonDetails
+					if err := json.Unmarshal(seasonInfoBody, &seasonInfo); err != nil {
+						fmt.Println("    Error unmarshaling season info:", err)
+						return
+					}
+					s.Seasons[idx].TotalCount = seasonInfo.ChildCount
+					// Parse season DateAdded if available
+					if seasonInfo.DateCreated != "" {
+						if dateAdded, err := time.Parse("2006-01-02T15:04:05.0000000Z", seasonInfo.DateCreated); err == nil {
+							s.Seasons[idx].DateAdded = dateAdded
+						} else if dateAdded, err := time.Parse("2006-01-02T15:04:05Z", seasonInfo.DateCreated); err == nil {
+							s.Seasons[idx].DateAdded = dateAdded
+						}
+					}
+					fmt.Printf("    Season %d: %d episodes total\n", s.Seasons[idx].SeasonNumber, seasonInfo.ChildCount)
+
+					seasonEpisodesBody, err := fetchAPI("season_episodes", s.Seasons[idx].SeasonId)
+					if err != nil {
+						fmt.Println("    Error fetching season episodes:", err)
+						return
+					}
+					var seasonEpisodes EpisodeList
+					if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
+						fmt.Println("    Error unmarshaling season episodes:", err)
+						return
+					}
+
+					fmt.Printf("    Fetching sizes for %d episodes\n", len(seasonEpisodes.Items))
+
+					// Parallelize episode size fetching
+					var epWg sync.WaitGroup
+					epSem := make(chan struct{}, 10) // Limit concurrent episode fetches
+					var sizeMu sync.Mutex
+					var totalSize int64
+					var earliestDate time.Time
+					var dateMu sync.Mutex
+					hasDate := false
+
+					for _, ep := range seasonEpisodes.Items {
+						epWg.Add(1)
+						go func(episode Episode) {
+							defer epWg.Done()
+							epSem <- struct{}{}
+							defer func() { <-epSem }()
+
+							episodeDetailsBody, err := fetchAPI("episode_details", episode.Id)
+							if err != nil {
+								return
+							}
+							var details MovieDetails
+							if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
+								return
+							}
+							if len(details.MediaSources) > 0 {
+								sizeMu.Lock()
+								totalSize += details.MediaSources[0].Size
+								sizeMu.Unlock()
+							}
+							// Capture DateAdded from episode
+							if details.DateCreated != "" {
+								var dateAdded time.Time
+								if parsed, err := time.Parse("2006-01-02T15:04:05.0000000Z", details.DateCreated); err == nil {
+									dateAdded = parsed
+								} else if parsed, err := time.Parse("2006-01-02T15:04:05Z", details.DateCreated); err == nil {
+									dateAdded = parsed
+								} else {
+									return
+								}
+								dateMu.Lock()
+								if !hasDate || dateAdded.Before(earliestDate) {
+									earliestDate = dateAdded
+									hasDate = true
+								}
+								dateMu.Unlock()
+							}
+						}(ep)
+					}
+
+					epWg.Wait()
+					s.Seasons[idx].SizeGB = float64(totalSize) / (1024 * 1024 * 1024)
+					// Use earliest episode date if season date not available
+					if hasDate && s.Seasons[idx].DateAdded.IsZero() {
+						s.Seasons[idx].DateAdded = earliestDate
+					}
+
+					mu.Lock()
+					s.TotalSize += s.Seasons[idx].SizeGB
+					mu.Unlock()
+
+					fmt.Printf("    Season %d: %.2f GB total\n", s.Seasons[idx].SeasonNumber, s.Seasons[idx].SizeGB)
+				}(i)
+			}
+
+			seasonWg.Wait()
+
+			// Update progress after series completes
+			current := atomic.AddInt32(&seriesCompleted, 1)
+			updateProgress(int(current), totalSeries, fmt.Sprintf("Completed %d/%d series", int(current), totalSeries))
+		}(series)
+	}
+
+	wg.Wait()
+
+	var seriesList []Series
+	for _, s := range grouped {
+		seriesList = append(seriesList, *s)
+	}
+
+	// Sort by name by default
+	sort.Slice(seriesList, func(i, j int) bool {
+		return seriesList[i].Name < seriesList[j].Name
+	})
+
+	fmt.Println("Returning", len(seriesList), "series")
+	return seriesList
+}
