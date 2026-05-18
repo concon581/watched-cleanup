@@ -1,0 +1,169 @@
+{{define "title"}}Storage Breakdown{{end}}
+
+{{define "extra-styles"}}
+<style>
+    .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+        margin-bottom: 24px;
+    }
+
+    .stat-card {
+        padding: 20px;
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        border: 1px solid var(--border-color);
+    }
+
+    .stat-label { color: var(--text-secondary); font-size: 13px; margin-bottom: 8px; text-transform: uppercase; }
+    .stat-value { font-size: 28px; font-weight: 700; color: var(--accent-primary); }
+
+    .breakdown-bar {
+        height: 40px;
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+        display: flex;
+        border: 1px solid var(--border-color);
+    }
+
+    .break-movies {
+        background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+        display: flex; align-items: center; justify-content: center; color: white; font-weight: 700;
+    }
+
+    .break-tv {
+        background: linear-gradient(90deg, #6fe7a7, #2ed573);
+        display: flex; align-items: center; justify-content: center; color: #031017; font-weight: 700;
+    }
+
+    .legend { display:flex; gap:12px; align-items:center; margin-top:12px; color:var(--text-secondary); }
+    .legend .dot { width:14px; height:14px; border-radius:50%; display:inline-block; }
+</style>
+{{end}}
+
+{{define "content"}}
+<div class="header">
+    <div class="header-content">
+        <h1>📊 Storage Breakdown</h1>
+        <div class="status">
+            {{if .IsRefreshing}}
+                {{.RefreshStatus}}
+            {{else if .LastRefresh.IsZero}}
+                No data loaded yet. Click refresh to fetch Movies + TV.
+            {{else}}
+                Last refreshed: {{.LastRefresh.Format "Jan 2, 2006 3:04 PM"}}
+            {{end}}
+        </div>
+    </div>
+    <button class="refresh-btn" onclick="refreshStorage()" id="storageRefreshBtn">🔄 Refresh Movies + TV</button>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-label">Filesystem ({{.DataPath}})</div>
+        <div class="stat-value">{{printf "%.1f" .TotalFSGB}} GB</div>
+        <div style="color:var(--text-secondary); margin-top:8px">{{.MoviesCount}} movies • {{.SeriesCount}} series</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Free</div>
+        <div class="stat-value">{{printf "%.1f" .FreeFSGB}} GB</div>
+        <div style="color:var(--text-secondary); margin-top:8px">{{printf "%.1f" .UsedPercent}}% used</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Used</div>
+        <div class="stat-value">{{printf "%.1f" .UsedFSGB}} GB</div>
+        <div style="color:var(--text-secondary); margin-top:8px">Movies: {{printf "%.1f" .MovieOfUsed}}% • TV: {{printf "%.1f" .TVOfUsed}}%</div>
+    </div>
+</div>
+<div class="stat-card" style="margin-bottom:16px">
+    <div class="stat-label">Proportion (of used)</div>
+    <div class="breakdown-bar">
+        <div class="break-movies" style="width: {{printf "%.2f" .MovieOfUsed}}%; min-width:0;">{{if gt .MovieOfUsed 3.0}}{{printf "%.0f%%" .MovieOfUsed}}{{end}}</div>
+        <div class="break-tv" style="width: {{printf "%.2f" .TVOfUsed}}%; min-width:0;">{{if gt .TVOfUsed 3.0}}{{printf "%.0f%%" .TVOfUsed}}{{end}}</div>
+    </div>
+    <div class="legend">
+        <div style="display:flex; gap:8px; align-items:center;">
+            <span class="dot" style="background:linear-gradient(90deg, var(--accent-primary), var(--accent-secondary))"></span>
+            <span>Movies</span>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+            <span class="dot" style="background:linear-gradient(90deg, #6fe7a7, #2ed573)"></span>
+            <span>TV</span>
+        </div>
+    </div>
+</div>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+    <div class="stat-card">
+        <div class="stat-label">Top Movies</div>
+        {{if .TopMovies}}
+        <ol style="margin-top:8px; color:var(--text-secondary);">
+            {{range .TopMovies}}
+            <li style="margin:8px 0; color:var(--text-primary);">{{.Name}} — {{printf "%.2f" .SizeGB}} GB</li>
+            {{end}}
+        </ol>
+        {{else}}
+        <div style="color:var(--text-secondary); margin-top:8px">No movies loaded</div>
+        {{end}}
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Top Series</div>
+        {{if .TopSeries}}
+        <ol style="margin-top:8px; color:var(--text-secondary);">
+            {{range .TopSeries}}
+            <li style="margin:8px 0; color:var(--text-primary);">{{.Name}} — {{printf "%.2f" .TotalSize}} GB</li>
+            {{end}}
+        </ol>
+        {{else}}
+        <div style="color:var(--text-secondary); margin-top:8px">No series loaded</div>
+        {{end}}
+    </div>
+</div>
+
+<script>
+    function refreshStorage() {
+        const btn = document.getElementById('storageRefreshBtn');
+        const statusEl = document.querySelector('.status');
+        btn.disabled = true;
+        btn.textContent = '⏳ Refreshing...';
+        if (statusEl) {
+            statusEl.textContent = 'Refreshing Movies + TV...';
+        }
+
+        fetch('/refresh-all', { method: 'POST' })
+            .then(() => checkRefreshStatus())
+            .catch(err => {
+                console.error('Error refreshing:', err);
+                alert('Error starting refresh: ' + err.message);
+                btn.disabled = false;
+                btn.textContent = '🔄 Refresh Movies + TV';
+            });
+    }
+
+    function checkRefreshStatus() {
+        fetch('/refresh-status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.isRefreshing) {
+                    document.querySelector('.status').textContent = data.message || 'Refreshing...';
+                    setTimeout(checkRefreshStatus, 1000);
+                } else {
+                    location.reload();
+                }
+            })
+            .catch(err => {
+                console.error('Error polling refresh status:', err);
+                alert('Error polling refresh status: ' + err.message);
+                const btn = document.getElementById('storageRefreshBtn');
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '🔄 Refresh Movies + TV';
+                }
+            });
+    }
+</script>
+
+{{end}}

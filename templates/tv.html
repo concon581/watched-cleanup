@@ -349,6 +349,11 @@
         </label>
         
         <label>
+            <input type="checkbox" id="watchedOnly" onchange="applyFilters()">
+            Watched only
+        </label>
+        
+        <label>
             <input type="checkbox" id="fullyWatched" onchange="applyFilters()">
             Fully watched only
         </label>
@@ -368,8 +373,9 @@
 <div id="seriesList" class="series-grid">
 {{range .Series}}
 {{$earliestDate := 0}}
-{{range .Seasons}}{{if not .DateAdded.IsZero}}{{if or (eq $earliestDate 0) (lt .DateAdded.Unix $earliestDate)}}{{$earliestDate = .DateAdded.Unix}}{{end}}{{end}}{{end}}
-<div class="series-card" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}" data-date="{{$earliestDate}}">
+{{$hasWatched := false}}
+{{range .Seasons}}{{if not .DateAdded.IsZero}}{{if or (eq $earliestDate 0) (lt .DateAdded.Unix $earliestDate)}}{{$earliestDate = .DateAdded.Unix}}{{end}}{{end}}{{if gt .WatchedCount 0}}{{$hasWatched = true}}{{end}}{{end}}
+<div class="series-card" data-size="{{.TotalSize}}" data-name="{{.Name}}" data-fully-watched="{{.FullyWatched}}" data-has-watched="{{$hasWatched}}" data-date="{{$earliestDate}}">
     <div class="series-header">
         {{if .ImageTags.Primary}}
         <img src="{{$.JellyfinBaseURL}}Items/{{.Id}}/Images/Primary?maxWidth=240" alt="{{.Name}}" class="series-poster">
@@ -454,6 +460,7 @@
     function applyFilters() {
         const sortBy = document.getElementById('sortBy').value;
         const minSize = parseFloat(document.getElementById('minSize').value) || 0;
+        const watchedOnly = document.getElementById('watchedOnly').checked;
         const fullyWatched = document.getElementById('fullyWatched').checked;
         
         const container = document.getElementById('seriesList');
@@ -461,9 +468,11 @@
         
         series.forEach(s => {
             const size = parseFloat(s.dataset.size);
+            const hasWatched = s.dataset.hasWatched === 'true';
             const isFullyWatched = s.dataset.fullyWatched === 'true';
             
             let show = size >= minSize;
+            if (watchedOnly && !hasWatched) show = false;
             if (fullyWatched && !isFullyWatched) show = false;
             
             s.style.display = show ? 'block' : 'none';
