@@ -54,6 +54,37 @@
             padding: 32px 24px;
         }
 
+        .site-nav {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 24px;
+            padding: 8px;
+            background: var(--bg-card);
+            border-radius: var(--radius-md);
+            border: 1px solid var(--border-color);
+        }
+
+        .site-nav a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            padding: 10px 16px;
+            border-radius: var(--radius-sm);
+            font-weight: 600;
+            font-size: 14px;
+            transition: all 0.15s ease;
+        }
+
+        .site-nav a:hover {
+            color: var(--text-primary);
+            background: var(--bg-hover);
+        }
+
+        .site-nav a.active {
+            color: var(--bg-primary);
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+        }
+
         .header {
             display: flex;
             justify-content: space-between;
@@ -364,6 +395,12 @@
 </head>
 <body>
     <div class="container">
+        <nav class="site-nav" aria-label="Main">
+            <a href="/">Movies</a>
+            <a href="/tv">TV</a>
+            <a href="/storage">Storage</a>
+            <a href="/storage-dashboard">Dashboard</a>
+        </nav>
         {{block "content" .}}{{end}}
     </div>
     
@@ -460,6 +497,16 @@
                     btn.textContent = 'Confirm Delete';
                 });
         };
+    </script>
+    <script>
+        (function () {
+            const path = window.location.pathname;
+            document.querySelectorAll('.site-nav a').forEach(function (link) {
+                if (link.getAttribute('href') === path) {
+                    link.classList.add('active');
+                }
+            });
+        })();
     </script>
     {{block "extra-scripts" .}}{{end}}
 </body>

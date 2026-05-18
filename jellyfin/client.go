@@ -22,8 +22,12 @@ func FetchAPI(client *http.Client, requestType string, id string) ([]byte, error
 	var api string
 	if requestType == "played_movies" {
 		api = "Users/" + jellyfinUserID + "/Items?Recursive=true&IsPlayed=true&IncludeItemTypes=Movie&Fields=DateCreated"
+	} else if requestType == "all_movies" {
+		api = "Users/" + jellyfinUserID + "/Items?Recursive=true&IncludeItemTypes=Movie&Fields=DateCreated"
 	} else if requestType == "watched_episodes" {
 		api = "Users/" + jellyfinUserID + "/Items?Recursive=true&IsPlayed=true&IncludeItemTypes=Episode&Fields=DateCreated"
+	} else if requestType == "all_episodes" {
+		api = "Users/" + jellyfinUserID + "/Items?Recursive=true&IncludeItemTypes=Episode&Fields=DateCreated"
 	} else if requestType == "season_details" {
 		api = "Items/" + id + "?userId=" + jellyfinUserID + "&Fields=DateCreated"
 	} else if requestType == "season_info" {
@@ -106,7 +110,7 @@ func CallJellyfinDelete(client *http.Client, id string) {
 
 // FetchMovieData retrieves and enriches movie data from Jellyfin
 func FetchMovieData(client *http.Client, updateProgress func(current, total int, message string)) models.MovieList {
-	body, err := FetchAPI(client, "played_movies", "")
+	body, err := FetchAPI(client, "all_movies", "")
 	if err != nil {
 		fmt.Println("Error fetching movies:", err)
 		return models.MovieList{}
@@ -178,7 +182,7 @@ func FetchMovieData(client *http.Client, updateProgress func(current, total int,
 
 // FetchTVData retrieves and enriches TV series data from Jellyfin
 func FetchTVData(client *http.Client, updateProgress func(current, total int, message string)) []models.Series {
-	body, err := FetchAPI(client, "watched_episodes", "")
+	body, err := FetchAPI(client, "all_episodes", "")
 	if err != nil {
 		fmt.Println("Error fetching episodes:", err)
 		return nil
@@ -222,16 +226,24 @@ func FetchTVData(client *http.Client, updateProgress func(current, total int, me
 		found := false
 		for i := range grouped[seriesId].Seasons {
 			if grouped[seriesId].Seasons[i].SeasonNumber == seasonNum {
-				grouped[seriesId].Seasons[i].WatchedCount++
+				grouped[seriesId].Seasons[i].TotalCount++
+				if ep.IsPlayed {
+					grouped[seriesId].Seasons[i].WatchedCount++
+				}
 				found = true
 				break
 			}
 		}
 		if !found {
+			watchedCount := 0
+			if ep.IsPlayed {
+				watchedCount = 1
+			}
 			grouped[seriesId].Seasons = append(grouped[seriesId].Seasons, models.SeasonInfo{
 				SeasonNumber: seasonNum,
 				SeasonId:     ep.SeasonId,
-				WatchedCount: 1,
+				WatchedCount: watchedCount,
+				TotalCount:   1,
 			})
 			fmt.Printf("  New season %d for %s (SeasonId: %s)\n", seasonNum, ep.SeriesName, ep.SeasonId)
 		}

@@ -100,6 +100,13 @@
         gap: 8px;
     }
 
+    label input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        accent-color: var(--accent-primary);
+        cursor: pointer;
+    }
+
     .movies-grid {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
@@ -313,6 +320,11 @@
         <label>Min Size (GB):
             <input type="number" id="minSize" value="0" min="0" step="5" onchange="applyFilters()" style="width: 80px;">
         </label>
+        
+        <label>
+            <input type="checkbox" id="watchedOnly" onchange="applyFilters()">
+            Watched only
+        </label>
     </div>
     <div class="controls-right">
         <button class="select-btn" onclick="selectAll()">✓ Select All</button>
@@ -328,7 +340,7 @@
 
 <div id="moviesList" class="movies-grid">
 {{range .Items}}
-<div class="movie-card" data-size="{{.SizeGB}}" data-name="{{.Name}}" data-date="{{if not .DateAdded.IsZero}}{{.DateAdded.Unix}}{{else}}0{{end}}">
+<div class="movie-card" data-size="{{.SizeGB}}" data-name="{{.Name}}" data-date="{{if not .DateAdded.IsZero}}{{.DateAdded.Unix}}{{else}}0{{end}}" data-is-played="{{.IsPlayed}}">
     <div class="movie-checkbox-container">
         <input type="checkbox" class="movie-checkbox" name="movie" value="{{.Id}}" data-path="{{.Path}}" onchange="updateSelectionCount()">
     </div>
@@ -402,13 +414,18 @@
     function applyFilters() {
         const sortBy = document.getElementById('sortBy').value;
         const minSize = parseFloat(document.getElementById('minSize').value) || 0;
+        const watchedOnly = document.getElementById('watchedOnly').checked;
 
         const container = document.getElementById('moviesList');
         const movies = Array.from(container.children);
 
         movies.forEach(m => {
             const size = parseFloat(m.dataset.size);
-            const show = size >= minSize;
+            const isPlayed = m.dataset.isPlayed === 'true';
+            
+            let show = size >= minSize;
+            if (watchedOnly && !isPlayed) show = false;
+            
             m.style.display = show ? 'block' : 'none';
         });
 

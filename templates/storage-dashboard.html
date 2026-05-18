@@ -1,0 +1,1516 @@
+{{define "title"}}Storage Dashboard{{end}}
+
+{{define "extra-styles"}}
+<style>
+    .dashboard-container {
+        display: grid;
+        gap: 24px;
+        margin-bottom: 24px;
+    }
+
+    .cards-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 16px;
+    }
+
+    .info-card {
+        padding: 24px;
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        border: 1px solid var(--border-color);
+        display: flex;
+        flex-direction: column;
+    }
+
+    .card-label {
+        color: var(--text-secondary);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 12px;
+        font-weight: 600;
+    }
+
+    .card-value {
+        font-size: 32px;
+        font-weight: 700;
+        color: var(--accent-primary);
+        line-height: 1;
+        margin-bottom: 8px;
+    }
+
+    .card-secondary {
+        font-size: 13px;
+        color: var(--text-secondary);
+    }
+
+    .card-bar {
+        height: 6px;
+        background: var(--bg-tertiary);
+        border-radius: 3px;
+        margin-top: 12px;
+        overflow: hidden;
+    }
+
+    .card-bar-fill {
+        height: 100%;
+        background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+        border-radius: 3px;
+    }
+
+    .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 16px;
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border-color);
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+        gap: 12px;
+    }
+
+    .toolbar-group {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        flex-wrap: wrap;
+    }
+
+    .filter-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .filter-toggle input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+        accent-color: var(--accent-primary);
+    }
+
+    .filter-toggle label {
+        cursor: pointer;
+        font-size: 14px;
+        color: var(--text-secondary);
+    }
+
+    .refresh-btn, .btn-secondary {
+        padding: 8px 16px;
+        background: var(--accent-primary);
+        color: var(--bg-primary);
+        border: none;
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 14px;
+        transition: all 0.15s ease;
+    }
+
+    .btn-secondary {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+    }
+
+    .refresh-btn:hover {
+        background: var(--accent-secondary);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(0, 212, 255, 0.2);
+    }
+
+    .btn-secondary:hover {
+        background: var(--bg-hover);
+    }
+
+    .charts-grid {
+        display: grid;
+        gap: 24px;
+        grid-template-columns: 1fr;
+    }
+
+    .chart-container {
+        background: var(--bg-card);
+        border-radius: var(--radius-md);
+        border: 1px solid var(--border-color);
+        padding: 24px;
+        box-shadow: var(--shadow-sm);
+    }
+
+    .chart-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin-bottom: 20px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .chart-subtitle {
+        font-size: 13px;
+        color: var(--text-secondary);
+        margin-bottom: 16px;
+    }
+
+    #overviewChart, #sunburstChart, #sizeDistributionChart {
+        width: 100%;
+        min-height: 320px;
+    }
+
+    .overview-row {
+        display: grid;
+        grid-template-columns: 1fr 1.2fr;
+        gap: 24px;
+        align-items: stretch;
+    }
+
+    @media (max-width: 900px) {
+        .overview-row {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .legend-grid {
+        display: grid;
+        gap: 12px;
+        margin-top: 8px;
+    }
+
+    .legend-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px;
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+        font-size: 13px;
+    }
+
+    .legend-item .swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 3px;
+        margin-right: 10px;
+        flex-shrink: 0;
+    }
+
+    .legend-item .label {
+        display: flex;
+        align-items: center;
+        flex: 1;
+        min-width: 0;
+        color: var(--text-primary);
+    }
+
+    .legend-item .pct {
+        color: var(--accent-primary);
+        font-weight: 700;
+        margin-left: 12px;
+    }
+
+    .top-items-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        max-height: 400px;
+        overflow-y: auto;
+        padding-right: 8px;
+    }
+
+    .top-items-list::-webkit-scrollbar {
+        width: 6px;
+    }
+
+    .top-items-list::-webkit-scrollbar-track {
+        background: var(--bg-tertiary);
+        border-radius: 3px;
+    }
+
+    .top-items-list::-webkit-scrollbar-thumb {
+        background: var(--accent-primary);
+        border-radius: 3px;
+    }
+
+    .item-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px;
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+        font-size: 13px;
+    }
+
+    .item-row.selectable {
+        gap: 12px;
+    }
+
+    .orphan-check {
+        width: 18px;
+        height: 18px;
+        flex: 0 0 auto;
+        accent-color: var(--accent-primary);
+        cursor: pointer;
+    }
+
+    .orphan-delete-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin: 10px 0 12px;
+        padding: 10px 12px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        flex-wrap: wrap;
+    }
+
+    .orphan-delete-status {
+        color: var(--text-secondary);
+        font-size: 12px;
+    }
+
+    .btn-danger {
+        background: rgba(255, 71, 87, 0.14);
+        color: #ff6b7a;
+        border-color: rgba(255, 71, 87, 0.35);
+    }
+
+    .btn-danger:hover {
+        background: rgba(255, 71, 87, 0.22);
+    }
+
+    .item-name {
+        flex: 1;
+        color: var(--text-primary);
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .item-size {
+        color: var(--accent-primary);
+        font-weight: 600;
+        margin-left: 12px;
+    }
+
+    .item-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        margin-left: 8px;
+        text-transform: uppercase;
+    }
+
+    .badge-watched {
+        background: rgba(46, 213, 115, 0.2);
+        color: #2ed573;
+    }
+
+    .badge-unwatched {
+        background: rgba(255, 71, 87, 0.2);
+        color: #ff4757;
+    }
+
+    .badge-torrents {
+        background: rgba(167, 139, 250, 0.2);
+        color: #a78bfa;
+    }
+
+    .badge-other {
+        background: rgba(100, 116, 139, 0.25);
+        color: #94a3b8;
+    }
+
+    .badge-music {
+        background: rgba(251, 191, 36, 0.2);
+        color: #fbbf24;
+    }
+
+    .badge-downloads {
+        background: rgba(96, 165, 250, 0.2);
+        color: #60a5fa;
+    }
+
+    .badge-orphan-torrent {
+        background: rgba(255, 71, 87, 0.2);
+        color: #ff6b7a;
+    }
+
+    .badge-orphan-library {
+        background: rgba(0, 212, 255, 0.15);
+        color: #00d4ff;
+    }
+
+    .badge-backup {
+        background: rgba(148, 163, 184, 0.2);
+        color: #cbd5e1;
+    }
+
+    .section-heading {
+        font-size: 15px;
+        font-weight: 700;
+        color: var(--text-primary);
+        margin: 24px 0 12px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .section-heading:first-of-type {
+        margin-top: 0;
+    }
+
+    .section-hint {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin: -8px 0 12px;
+    }
+
+    .item-path {
+        display: block;
+        font-size: 11px;
+        color: var(--text-muted);
+        margin-top: 2px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .other-summary {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 12px;
+        margin-bottom: 20px;
+    }
+
+    .other-summary .stat {
+        padding: 14px 16px;
+        background: var(--bg-tertiary);
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-color);
+    }
+
+    .other-summary .stat-label {
+        font-size: 11px;
+        text-transform: uppercase;
+        color: var(--text-secondary);
+        margin-bottom: 6px;
+    }
+
+    .other-summary .stat-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--accent-primary);
+    }
+
+    .last-updated {
+        text-align: center;
+        color: var(--text-secondary);
+        font-size: 12px;
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 1px solid var(--border-color);
+    }
+
+    .loading {
+        text-align: center;
+        padding: 48px;
+        color: var(--text-secondary);
+        font-size: 14px;
+    }
+
+    .error {
+        background: rgba(255, 71, 87, 0.1);
+        border: 1px solid #ff4757;
+        color: #ff4757;
+        padding: 16px;
+        border-radius: var(--radius-sm);
+        margin-bottom: 24px;
+    }
+
+    @media (max-width: 768px) {
+        .toolbar {
+            flex-direction: column;
+            align-items: flex-start;
+        }
+
+        .toolbar-group {
+            width: 100%;
+        }
+
+        .card-value {
+            font-size: 24px;
+        }
+
+        .charts-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    .tabs-container {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 24px;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .tab-button {
+        padding: 12px 16px;
+        background: transparent;
+        border: none;
+        color: var(--text-secondary);
+        font-weight: 600;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        transition: all 0.15s ease;
+        font-size: 14px;
+    }
+
+    .tab-button.active {
+        color: var(--accent-primary);
+        border-bottom-color: var(--accent-primary);
+    }
+
+    .tab-button:hover {
+        color: var(--text-primary);
+    }
+
+    .tab-content {
+        display: none;
+    }
+
+    .tab-content.active {
+        display: block;
+    }
+</style>
+{{end}}
+
+{{define "content"}}
+<div class="header">
+    <div class="header-content">
+        <h1>📊 Storage Dashboard</h1>
+        <p class="status">Interactive storage analytics with drill-down exploration</p>
+    </div>
+    <div class="toolbar-group">
+        <button class="refresh-btn" onclick="refreshDashboard()" id="refreshBtn">Reload data</button>
+        <button class="btn-secondary" onclick="syncLibrary()" id="syncBtn">Sync library</button>
+    </div>
+</div>
+
+<div class="dashboard-container">
+    <!-- Info Cards -->
+    <div class="cards-grid" id="cardsContainer">
+        <div class="info-card loading">Loading storage data...</div>
+    </div>
+    <div class="chart-container" id="scanWidget">
+        <div class="chart-title">Scan status</div>
+        <div class="chart-subtitle" id="scanWidgetMessage">Waiting for scan status...</div>
+        <div class="other-summary" id="scanStageSummary"></div>
+    </div>
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+        <div class="toolbar-group">
+            <div class="filter-toggle">
+                <input type="checkbox" id="filterWatched" onchange="updateCharts()">
+                <label for="filterWatched">Hide Watched Content</label>
+            </div>
+            <span class="chart-subtitle" id="dataTimestamp"></span>
+        </div>
+        <div class="toolbar-group">
+            <button class="btn-secondary" onclick="exportData()">📥 Export JSON</button>
+            <button class="btn-secondary" onclick="autoRefreshToggle()" id="autoRefreshBtn">🔁 Auto-Refresh: OFF</button>
+        </div>
+    </div>
+
+    <!-- Overview -->
+    <div class="overview-row">
+        <div class="chart-container">
+            <div class="chart-title">Storage split</div>
+            <div class="chart-subtitle">Share of used disk space by category</div>
+            <div id="overviewChart" style="height: 340px;"></div>
+        </div>
+        <div class="chart-container">
+            <div class="chart-title">At a glance</div>
+            <div class="chart-subtitle">Movies vs TV on your used volume</div>
+            <div id="overviewLegend" class="legend-grid"></div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs-container">
+        <button class="tab-button active" onclick="switchTab(event, 'hierarchical')">Hierarchical View</button>
+        <button class="tab-button" onclick="switchTab(event, 'distribution')">Size Distribution</button>
+        <button class="tab-button" onclick="switchTab(event, 'top-items')">Top Items</button>
+        <button class="tab-button" onclick="switchTab(event, 'other-disk')">Beyond Movies & TV</button>
+        <button class="tab-button" onclick="switchTab(event, 'orphans')">Orphans</button>
+        <button class="tab-button" onclick="switchTab(event, 'scan')">Scan</button>
+    </div>
+
+    <!-- Charts Section -->
+    <div class="charts-grid">
+        <!-- Hierarchical View Tab -->
+        <div id="hierarchical" class="tab-content active chart-container">
+            <div class="chart-title">📈 Storage Hierarchy</div>
+            <div class="chart-subtitle">Click on sections to drill down into Movies or TV content</div>
+            <div id="sunburstChart" style="height: 500px;"></div>
+        </div>
+
+        <!-- Distribution View Tab -->
+        <div id="distribution" class="tab-content chart-container">
+            <div class="chart-title">📊 Size Distribution</div>
+            <div class="chart-subtitle">Number of items by size range</div>
+            <div id="sizeDistributionChart" style="height: 400px;"></div>
+        </div>
+
+        <!-- Top Items Tab -->
+        <div id="top-items" class="tab-content chart-container">
+            <div class="chart-title">🏆 Top 15 Largest Items</div>
+            <div class="chart-subtitle">Movies and TV series using the most storage</div>
+            <div id="topItemsContainer" class="top-items-list loading">Loading...</div>
+        </div>
+
+        <div id="other-disk" class="tab-content chart-container">
+            <div class="chart-title">Beyond movies &amp; TV</div>
+            <div class="chart-subtitle">Real folder sizes on disk — torrents, music, downloads, and anything not in your Jellyfin movie/TV libraries</div>
+            <div id="otherSummary" class="other-summary"></div>
+            <h3 class="section-heading">Everything else on disk</h3>
+            <p class="section-hint">Sorted by size. Torrent folder sizes include linked files (same inode as movies/TV). Use the <strong>Orphans</strong> tab to see files not hardlinked across torrents and libraries.</p>
+            <div id="otherItemsContainer" class="top-items-list loading">Scanning disk...</div>
+            <h3 class="section-heading">Movie &amp; TV library folders</h3>
+            <p class="section-hint">On-disk library size vs what Jellyfin reports (hardlinks and metadata can differ).</p>
+            <div id="libraryItemsContainer" class="top-items-list loading">Scanning disk...</div>
+        </div>
+
+        <div id="orphans" class="tab-content chart-container">
+            <div class="chart-title">Orphan files (hardlink check)</div>
+            <div class="chart-subtitle">Files with no inode link between torrents and movie/TV libraries. Linked pairs share disk space once — orphans are duplicates or leftovers.</div>
+            <div class="toolbar" style="margin-bottom:16px">
+                <button class="refresh-btn" onclick="startOrphanScan()" id="orphanScanBtn">Scan for orphans</button>
+                <span class="chart-subtitle" id="orphanScanStatus"></span>
+            </div>
+            <div id="orphanSummary" class="other-summary"></div>
+            <h3 class="section-heading">Only in torrents (not linked to library)</h3>
+            <p class="section-hint">These use extra space — no matching inode under your movie/TV folders.</p>
+            <div class="orphan-delete-bar">
+                <div class="toolbar-group">
+                    <button class="btn-secondary" onclick="setOrphanSelection('torrents', true)">Select all torrents</button>
+                    <button class="btn-secondary" onclick="setOrphanSelection('torrents', false)">Clear</button>
+                </div>
+                <div class="toolbar-group">
+                    <span class="orphan-delete-status" id="torrentDeleteStatus">0 selected</span>
+                    <button class="btn-secondary" onclick="deleteSelectedOrphans('torrents', true)" id="torrentDryRunBtn" disabled>Test selected</button>
+                    <button class="btn-secondary btn-danger" onclick="deleteSelectedOrphans('torrents', false)" id="torrentDeleteBtn" disabled>Delete selected torrents</button>
+                </div>
+            </div>
+            <div id="torrentOrphansList" class="top-items-list loading">Run a scan to find torrent orphans.</div>
+            <h3 class="section-heading">Only in movies / TV (not linked to torrents)</h3>
+            <p class="section-hint">Library files with no copy under TORRENTS_PATH.</p>
+            <div class="orphan-delete-bar">
+                <div class="toolbar-group">
+                    <button class="btn-secondary" onclick="setOrphanSelection('library', true)">Select all movies / TV</button>
+                    <button class="btn-secondary" onclick="setOrphanSelection('library', false)">Clear</button>
+                </div>
+                <div class="toolbar-group">
+                    <span class="orphan-delete-status" id="libraryDeleteStatus">0 selected</span>
+                    <button class="btn-secondary" onclick="deleteSelectedOrphans('library', true)" id="libraryDryRunBtn" disabled>Test selected</button>
+                    <button class="btn-secondary btn-danger" onclick="deleteSelectedOrphans('library', false)" id="libraryDeleteBtn" disabled>Delete selected movies / TV</button>
+                </div>
+            </div>
+            <div id="libraryOrphansList" class="top-items-list loading">Run a scan to find library orphans.</div>
+        </div>
+
+        <div id="scan" class="tab-content chart-container">
+            <div class="chart-title">Unified scan</div>
+            <div class="chart-subtitle">The same scan feeds Jellyfin data, disk usage, and orphan hardlink checks.</div>
+            <div class="toolbar" style="margin-bottom:16px">
+                <button class="refresh-btn" onclick="syncLibrary()" id="scanRunBtn">Run scan</button>
+                <span class="chart-subtitle" id="scanPageStatus"></span>
+            </div>
+            <div id="scanStagesList" class="top-items-list loading">Loading scan status...</div>
+        </div>
+
+        <div class="last-updated" id="lastUpdatedText"></div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script>
+    const COLORS = { movies: '#00d4ff', tv: '#a78bfa', other: '#64748b', free: '#2ed573' };
+    let storageData = null;
+    let overviewChart = null;
+    let sunburstChart = null;
+    let sizeDistributionChart = null;
+    let autoRefreshInterval = null;
+    let scanPollTimer = null;
+    let orphanDataCache = null;
+
+    // Initialize dashboard
+    async function initDashboard() {
+        await loadStorageData();
+        initCharts();
+        loadOrphanData();
+        pollScanStatus();
+    }
+
+    // Load storage data from API
+    async function loadStorageData() {
+        try {
+            const response = await fetch('/api/storage-data');
+            storageData = await response.json();
+            renderScanStatus(storageData.scan || {});
+            updateUI();
+        } catch (error) {
+            console.error('Error loading storage data:', error);
+            showError('Failed to load storage data');
+        }
+    }
+
+    // Update all UI elements
+    function updateUI() {
+        updateInfoCards();
+        updateTimestamp();
+        updateCharts();
+    }
+
+    // Update info cards
+    function updateInfoCards() {
+        const fs = storageData.filesystem;
+        const movies = storageData.movies;
+        const tv = storageData.tv;
+        const totalGB = fs.totalGB || 0;
+        const moviePct = totalGB ? (movies.totalGB / totalGB) * 100 : 0;
+        const tvPct = totalGB ? (tv.totalGB / totalGB) * 100 : 0;
+        const freePct = totalGB ? (fs.freeGB / totalGB) * 100 : 0;
+
+        const cardsHTML = `
+            <div class="info-card">
+                <div class="card-label">Total Storage</div>
+                <div class="card-value">${fs.totalGB.toFixed(1)} GB</div>
+                <div class="card-secondary">${(fs.usedPct || 0).toFixed(1)}% used</div>
+                <div class="card-bar">
+                    <div class="card-bar-fill" style="width: ${Math.min(fs.usedPct || 0, 100)}%"></div>
+                </div>
+            </div>
+            <div class="info-card">
+                <div class="card-label">Movies</div>
+                <div class="card-value">${movies.totalGB.toFixed(1)} GB</div>
+                <div class="card-secondary">${movies.count} items • ${movies.watched} watched</div>
+                <div class="card-bar">
+                    <div class="card-bar-fill" style="width: ${moviePct}%"></div>
+                </div>
+            </div>
+            <div class="info-card">
+                <div class="card-label">TV Series</div>
+                <div class="card-value">${tv.totalGB.toFixed(1)} GB</div>
+                <div class="card-secondary">${tv.count} series • ${tv.watched} watched</div>
+                <div class="card-bar">
+                    <div class="card-bar-fill" style="width: ${tvPct}%"></div>
+                </div>
+            </div>
+            <div class="info-card">
+                <div class="card-label">Free Space</div>
+                <div class="card-value">${fs.freeGB.toFixed(1)} GB</div>
+                <div class="card-secondary">${freePct.toFixed(1)}% Available</div>
+                <div class="card-bar">
+                    <div class="card-bar-fill" style="width: ${freePct}%"></div>
+                </div>
+            </div>
+        `;
+        document.getElementById('cardsContainer').innerHTML = cardsHTML;
+    }
+
+    function renderScanStatus(scan) {
+        const message = scan.message || (scan.scanning ? 'Scanning...' : 'No scan has run yet');
+        const stages = scan.stages || [];
+        const completed = stages.filter(stage => stage.status === 'complete').length;
+        const running = stages.find(stage => stage.status === 'running');
+        const started = scan.startedAt ? new Date(scan.startedAt).toLocaleString() : 'Not started';
+        const finished = scan.finishedAt ? new Date(scan.finishedAt).toLocaleString() : '';
+
+        const widgetMessage = document.getElementById('scanWidgetMessage');
+        if (widgetMessage) {
+            widgetMessage.textContent = scan.scanning
+                ? `${message}${running ? ' · ' + running.name : ''}`
+                : `${message}${finished ? ' · Finished ' + finished : ''}`;
+        }
+
+        const t = 'd' + 'iv';
+        const summary = document.getElementById('scanStageSummary');
+        if (summary) {
+            summary.innerHTML = `
+                <${t} class="stat"><${t} class="stat-label">State</${t}><${t} class="stat-value">${scan.scanning ? 'Running' : 'Idle'}</${t}></${t}>
+                <${t} class="stat"><${t} class="stat-label">Progress</${t}><${t} class="stat-value">${completed}/${stages.length || 4}</${t}></${t}>
+                <${t} class="stat"><${t} class="stat-label">Reason</${t}><${t} class="stat-value">${escapeHtml(scan.reason || 'startup')}</${t}></${t}>
+                <${t} class="stat"><${t} class="stat-label">Started</${t}><${t} class="stat-value" style="font-size:14px">${escapeHtml(started)}</${t}></${t}>
+            `;
+        }
+
+        const pageStatus = document.getElementById('scanPageStatus');
+        if (pageStatus) pageStatus.textContent = message;
+
+        const runBtn = document.getElementById('scanRunBtn');
+        const syncBtn = document.getElementById('syncBtn');
+        [runBtn, syncBtn].forEach(btn => {
+            if (!btn) return;
+            btn.disabled = !!scan.scanning;
+            if (btn === syncBtn) btn.textContent = scan.scanning ? 'Scanning...' : 'Sync library';
+            if (btn === runBtn) btn.textContent = scan.scanning ? 'Scanning...' : 'Run scan';
+        });
+
+        const list = document.getElementById('scanStagesList');
+        if (list) {
+            if (!stages.length) {
+                list.innerHTML = '<div class="loading">No scan stages available yet.</div>';
+            } else {
+                list.innerHTML = stages.map(stage => `
+                    <div class="item-row">
+                        <div class="item-name">
+                            ${escapeHtml(stage.name)}
+                            <span class="item-path">${escapeHtml(stage.message || '')}</span>
+                        </div>
+                        <span class="item-badge ${stage.status === 'complete' ? 'badge-watched' : stage.status === 'error' ? 'badge-orphan-torrent' : 'badge-unwatched'}">${escapeHtml(stage.status)}</span>
+                    </div>
+                `).join('');
+            }
+        }
+    }
+
+    async function pollScanStatus() {
+        try {
+            const res = await fetch('/api/scan-status');
+            const scan = await res.json();
+            renderScanStatus(scan);
+            if (scan.scanning) {
+                if (scanPollTimer) clearTimeout(scanPollTimer);
+                scanPollTimer = setTimeout(pollScanStatus, 1500);
+            } else {
+                if (scanPollTimer) clearTimeout(scanPollTimer);
+                scanPollTimer = null;
+                await loadStorageData();
+                loadOrphanData();
+            }
+        } catch (e) {
+            scanPollTimer = null;
+        }
+    }
+
+    // Update timestamp
+    function updateTimestamp() {
+        const time = new Date(storageData.timestamp).toLocaleTimeString();
+        const date = new Date(storageData.timestamp).toLocaleDateString();
+        document.getElementById('dataTimestamp').textContent = `Last updated: ${date} ${time}`;
+        document.getElementById('lastUpdatedText').textContent = `Data refreshed at ${time}`;
+    }
+
+    function hideWatchedEnabled() {
+        return document.getElementById('filterWatched').checked;
+    }
+
+    function filteredItems(category) {
+        const items = category.items || [];
+        if (!hideWatchedEnabled()) return items;
+        return items.filter(item => !item.watched);
+    }
+
+    function sumSize(items) {
+        return items.reduce((sum, item) => sum + (item.sizeGB || 0), 0);
+    }
+
+    function pct(part, total) {
+        if (!total) return 0;
+        return (part / total) * 100;
+    }
+
+    function formatGB(value) {
+        return (value || 0).toFixed(2) + ' GB';
+    }
+
+    function formatPct(value) {
+        return (value || 0).toFixed(1) + '%';
+    }
+
+    function bucketItems(items, limit) {
+        const sorted = [...items].sort((a, b) => b.sizeGB - a.sizeGB);
+        if (sorted.length <= limit) {
+            return sorted.map(item => ({ name: item.name, value: item.sizeGB }));
+        }
+        const top = sorted.slice(0, limit);
+        const rest = sorted.slice(limit);
+        const otherSize = rest.reduce((sum, item) => sum + item.sizeGB, 0);
+        const children = top.map(item => ({ name: item.name, value: item.sizeGB }));
+        children.push({
+            name: `Other (${rest.length} items)`,
+            value: otherSize
+        });
+        return children;
+    }
+
+    function buildTVChildren(seriesList) {
+        return seriesList.map(series => {
+            const node = { name: series.name, value: series.sizeGB };
+            if (series.seasons && series.seasons.length > 1) {
+                node.children = series.seasons.map(season => ({
+                    name: 'Season ' + season.number,
+                    value: season.sizeGB
+                }));
+            }
+            return node;
+        });
+    }
+
+    function buildSunburstTree() {
+        const movies = filteredItems(storageData.movies);
+        const tv = filteredItems(storageData.tv);
+        const moviesSize = sumSize(movies);
+        const tvSize = sumSize(tv);
+        const usedGB = storageData.filesystem.usedGB || (moviesSize + tvSize);
+        const otherSize = Math.max(usedGB - moviesSize - tvSize, 0);
+
+        const children = [];
+        if (moviesSize > 0) {
+            children.push({
+                name: 'Movies',
+                value: moviesSize,
+                itemStyle: { color: COLORS.movies },
+                children: bucketItems(movies, 30)
+            });
+        }
+        if (tvSize > 0) {
+            const tvSorted = [...tv].sort((a, b) => b.sizeGB - a.sizeGB);
+            let tvChildren = buildTVChildren(tvSorted.length > 30 ? tvSorted.slice(0, 30) : tvSorted);
+            if (tvSorted.length > 30) {
+                const rest = tvSorted.slice(30);
+                tvChildren.push({
+                    name: 'Other (' + rest.length + ' series)',
+                    value: sumSize(rest)
+                });
+            }
+            children.push({
+                name: 'TV',
+                value: tvSize,
+                itemStyle: { color: COLORS.tv },
+                children: tvChildren
+            });
+        }
+        if (otherSize > 0.01) {
+            children.push({
+                name: 'Other (on disk)',
+                value: otherSize,
+                itemStyle: { color: COLORS.other }
+            });
+        }
+
+        return {
+            name: 'Used storage',
+            value: usedGB,
+            children: children
+        };
+    }
+
+    function getChart(el) {
+        if (!el) return null;
+        let chart = echarts.getInstanceByDom(el);
+        if (!chart) chart = echarts.init(el, null, { renderer: 'canvas' });
+        return chart;
+    }
+
+    function chartTooltip() {
+        return {
+            trigger: 'item',
+            backgroundColor: '#1e1e1e',
+            borderColor: '#333',
+            textStyle: { color: '#fff', fontSize: 12 },
+            formatter: function(params) {
+                const value = params.value || 0;
+                const percent = params.percent != null ? params.percent.toFixed(1) : '0.0';
+                return `${params.name}<br/>${formatGB(value)} (${percent}%)`;
+            }
+        };
+    }
+
+    function renderOverviewChart() {
+        const movies = filteredItems(storageData.movies);
+        const tv = filteredItems(storageData.tv);
+        const moviesSize = sumSize(movies);
+        const tvSize = sumSize(tv);
+        const usedGB = storageData.filesystem.usedGB || (moviesSize + tvSize);
+        const otherSize = Math.max(usedGB - moviesSize - tvSize, 0);
+        const freeGB = storageData.filesystem.freeGB || 0;
+
+        const segments = [
+            { name: 'Movies', value: moviesSize, color: COLORS.movies },
+            { name: 'TV', value: tvSize, color: COLORS.tv },
+            { name: 'Other (on disk)', value: otherSize, color: COLORS.other },
+            { name: 'Free', value: freeGB, color: COLORS.free }
+        ].filter(s => s.value > 0.001);
+
+        overviewChart = getChart(document.getElementById('overviewChart'));
+        overviewChart.setOption({
+            backgroundColor: 'transparent',
+            tooltip: chartTooltip(),
+            series: [{
+                type: 'pie',
+                radius: ['42%', '72%'],
+                center: ['50%', '50%'],
+                avoidLabelOverlap: true,
+                itemStyle: { borderColor: '#1e1e1e', borderWidth: 2 },
+                label: {
+                    color: '#b3b3b3',
+                    formatter: '{b}\n{d}%'
+                },
+                data: segments.map(s => ({
+                    name: s.name,
+                    value: s.value,
+                    itemStyle: { color: s.color }
+                }))
+            }]
+        }, true);
+
+        const mediaTotal = moviesSize + tvSize;
+        const legend = document.getElementById('overviewLegend');
+        const rows = [
+            { label: 'Movies', value: moviesSize, color: COLORS.movies, pct: pct(moviesSize, usedGB) },
+            { label: 'TV', value: tvSize, color: COLORS.tv, pct: pct(tvSize, usedGB) },
+            { label: 'Other on disk', value: otherSize, color: COLORS.other, pct: pct(otherSize, usedGB) }
+        ];
+        legend.innerHTML = rows.map(row => `
+            <div class="legend-item">
+                <div class="label">
+                    <span class="swatch" style="background:${row.color}"></span>
+                    ${row.label}
+                </div>
+                <span class="pct">${formatPct(row.pct)} · ${formatGB(row.value)}</span>
+            </div>
+        `).join('') + `
+            <div class="legend-item">
+                <div class="label">
+                    <span class="swatch" style="background:${COLORS.free}"></span>
+                    Free space
+                </div>
+                <span class="pct">${formatPct(pct(freeGB, storageData.filesystem.totalGB))} · ${formatGB(freeGB)}</span>
+            </div>
+            <div class="legend-item">
+                <div class="label">Movies vs TV (of media)</div>
+                <span class="pct">${formatPct(pct(moviesSize, mediaTotal))} movies · ${formatPct(pct(tvSize, mediaTotal))} TV</span>
+            </div>
+        `;
+    }
+
+    function renderSunburstChart() {
+        sunburstChart = getChart(document.getElementById('sunburstChart'));
+        sunburstChart.setOption({
+            backgroundColor: 'transparent',
+            tooltip: chartTooltip(),
+            series: [{
+                type: 'sunburst',
+                radius: [0, '92%'],
+                sort: undefined,
+                emphasis: { focus: 'ancestor' },
+                levels: [
+                    {},
+                    { r0: '12%', r: '38%', label: { rotate: 'tangential', fontSize: 11 } },
+                    { r0: '38%', r: '72%', label: { fontSize: 10 } },
+                    { r0: '72%', r: '92%', label: { position: 'outside', padding: 2, fontSize: 9 } }
+                ],
+                data: [buildSunburstTree()],
+                label: { color: '#e5e5e5' }
+            }]
+        }, true);
+    }
+
+    function renderDistributionChart() {
+        const dist = storageData.sizeDistribution;
+        const categories = ['0-500MB', '500MB-2GB', '2GB-10GB', '10GB+'];
+        sizeDistributionChart = getChart(document.getElementById('sizeDistributionChart'));
+        sizeDistributionChart.setOption({
+            backgroundColor: 'transparent',
+            tooltip: { trigger: 'axis', backgroundColor: '#1e1e1e', borderColor: '#333', textStyle: { color: '#fff' } },
+            legend: { top: 0, textStyle: { color: '#b3b3b3' } },
+            grid: { left: 40, right: 20, top: 40, bottom: 30 },
+            xAxis: {
+                type: 'category',
+                data: categories,
+                axisLabel: { color: '#909090' },
+                axisLine: { lineStyle: { color: '#333' } }
+            },
+            yAxis: {
+                type: 'value',
+                name: 'Items',
+                nameTextStyle: { color: '#909090' },
+                axisLabel: { color: '#909090' },
+                splitLine: { lineStyle: { color: '#2a2a2a' } }
+            },
+            series: [
+                {
+                    name: 'Movies',
+                    type: 'bar',
+                    data: categories.map(cat => dist.movies[cat] || 0),
+                    itemStyle: { color: COLORS.movies }
+                },
+                {
+                    name: 'TV',
+                    type: 'bar',
+                    data: categories.map(cat => dist.tv[cat] || 0),
+                    itemStyle: { color: COLORS.tv }
+                }
+            ]
+        }, true);
+    }
+
+    function initCharts() {
+        if (!storageData || typeof echarts === 'undefined') return;
+        renderOverviewChart();
+        renderSunburstChart();
+        renderDistributionChart();
+        updateTopItems();
+        updateOtherList();
+
+        window.requestAnimationFrame(() => {
+            [overviewChart, sunburstChart, sizeDistributionChart].forEach(chart => chart && chart.resize());
+        });
+    }
+
+    // Update charts (for filtering)
+    function updateCharts() {
+        initCharts();
+    }
+
+    // Update top items list
+    function updateTopItems() {
+        const allItems = [];
+
+        storageData.movies.items.forEach(m => {
+            allItems.push({
+                name: m.name,
+                size: m.sizeGB,
+                type: 'movie',
+                watched: m.watched
+            });
+        });
+
+        storageData.tv.items.forEach(t => {
+            allItems.push({
+                name: t.name,
+                size: t.sizeGB,
+                type: 'tv',
+                watched: t.watched
+            });
+        });
+
+        const hideWatched = hideWatchedEnabled();
+        const filtered = hideWatched ? allItems.filter(item => !item.watched) : allItems;
+        filtered.sort((a, b) => b.size - a.size);
+        const top15 = filtered.slice(0, 15);
+
+        const html = top15.map(item => `
+            <div class="item-row">
+                <div class="item-name">${item.type === 'movie' ? '🎬' : '📺'} ${item.name}</div>
+                <span class="item-size">${item.size.toFixed(2)} GB</span>
+                <span class="item-badge ${item.watched ? 'badge-watched' : 'badge-unwatched'}">
+                    ${item.watched ? '✓ Watched' : '✗ New'}
+                </span>
+            </div>
+        `).join('');
+
+        document.getElementById('topItemsContainer').innerHTML = html || '<div class="loading">No items to display</div>';
+    }
+
+
+    function escapeHtml(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function escapeAttr(text) {
+        return escapeHtml(text).replace(/'/g, '&#39;');
+    }
+
+
+    function categoryBadge(category) {
+        const map = {
+            torrents: { className: 'badge-torrents', label: 'Torrents' },
+            music: { className: 'badge-music', label: 'Music' },
+            downloads: { className: 'badge-downloads', label: 'Downloads' },
+            backup: { className: 'badge-backup', label: 'Backup' },
+            other: { className: 'badge-other', label: 'Other' }
+        };
+        return map[category] || map.other;
+    }
+
+    function renderDiskRows(items, denomGB) {
+        const t = 'd' + 'iv';
+        if (!items.length) {
+            return '<' + t + ' class="loading">Nothing found in this section.</' + t + '>';
+        }
+        return items.map(item => {
+            const badge = categoryBadge(item.category);
+            const share = pct(item.sizeGB, denomGB);
+            return `
+                <${t} class="item-row">
+                    <${t} class="item-name">
+                        ${escapeHtml(item.name)}
+                        <span class="item-path">${escapeHtml(item.path)}</span>
+                    </${t}>
+                    <span class="item-size">${item.sizeGB.toFixed(2)} GB</span>
+                    <span class="item-badge ${badge.className}">${badge.label} · ${formatPct(share)}</span>
+                </${t}>
+            `;
+        }).join('');
+    }
+
+    function updateOtherList() {
+        const other = storageData.other || { totalGB: 0, beyondMediaGB: 0, gapGB: 0, items: [], libraries: [] };
+        const items = [...(other.items || [])].sort((a, b) => b.sizeGB - a.sizeGB);
+        const libraries = [...(other.libraries || [])].sort((a, b) => b.diskGB - a.diskGB);
+        const beyondGB = other.beyondMediaGB || items.reduce((sum, item) => sum + item.sizeGB, 0);
+        const usedGB = storageData.filesystem.usedGB || 0;
+        const moviesGB = storageData.movies.totalGB || 0;
+        const tvGB = storageData.tv.totalGB || 0;
+        const beyondDenom = beyondGB > 0 ? beyondGB : 1;
+        const t = 'd' + 'iv';
+
+        document.getElementById('otherSummary').innerHTML = `
+            <${t} class="stat">
+                <${t} class="stat-label">Beyond movies &amp; TV</${t}>
+                <${t} class="stat-value">${formatGB(beyondGB)}</${t}>
+            </${t}>
+            <${t} class="stat">
+                <${t} class="stat-label">Jellyfin movies + TV</${t}>
+                <${t} class="stat-value">${formatGB(moviesGB + tvGB)}</${t}>
+            </${t}>
+            <${t} class="stat">
+                <${t} class="stat-label">Unexplained gap</${t}>
+                <${t} class="stat-value">${formatGB(other.gapGB || 0)}</${t}>
+            </${t}>
+            <${t} class="stat">
+                <${t} class="stat-label">Disk used (total)</${t}>
+                <${t} class="stat-value">${formatGB(usedGB)}</${t}>
+            </${t}>
+        `;
+
+        document.getElementById('otherItemsContainer').innerHTML = items.length
+            ? renderDiskRows(items, beyondDenom)
+            : '<' + t + ' class="loading">No non-library folders found under your data path.</' + t + '>';
+
+        const libContainer = document.getElementById('libraryItemsContainer');
+        if (!libraries.length) {
+            libContainer.innerHTML = '<' + t + ' class="loading">No top-level movie/TV folders found. Libraries may be nested — check the list above.</' + t + '>';
+            return;
+        }
+
+        libContainer.innerHTML = libraries.map(lib => {
+            const badgeClass = lib.category === 'movies' ? 'badge-watched' : 'badge-torrents';
+            const label = lib.category === 'movies' ? 'Movies library' : 'TV library';
+            const delta = lib.deltaGB || 0;
+            const deltaText = lib.jellyfinGB > 0
+                ? (delta >= 0 ? `+${delta.toFixed(2)} GB on disk vs Jellyfin` : `${delta.toFixed(2)} GB less on disk`)
+                : '';
+            return `
+                <${t} class="item-row">
+                    <${t} class="item-name">
+                        ${escapeHtml(lib.name)}
+                        <span class="item-path">${escapeHtml(lib.path)}</span>
+                    </${t}>
+                    <span class="item-size">${lib.diskGB.toFixed(2)} GB disk</span>
+                    <span class="item-badge ${badgeClass}">${label}${lib.jellyfinGB > 0 ? ' · ' + lib.jellyfinGB.toFixed(2) + ' GB Jellyfin' : ''}</span>
+                </${t}>
+                ${deltaText ? `<${t} class="item-path" style="padding:0 12px 8px">${deltaText}</${t}>` : ''}
+            `;
+        }).join('');
+    }
+    // Refresh dashboard
+    async function refreshDashboard() {
+        const btn = document.getElementById('refreshBtn');
+        btn.disabled = true;
+        btn.textContent = '⏳ Loading...';
+
+        try {
+            await loadStorageData();
+            btn.textContent = '✓ Refreshed';
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = '🔄 Refresh';
+            }, 2000);
+        } catch (error) {
+            btn.textContent = '✗ Error';
+            btn.disabled = false;
+            setTimeout(() => {
+                btn.textContent = '🔄 Refresh';
+            }, 2000);
+        }
+    }
+
+    // Auto-refresh toggle
+    function autoRefreshToggle() {
+        const btn = document.getElementById('autoRefreshBtn');
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+            autoRefreshInterval = null;
+            btn.textContent = '🔁 Auto-Refresh: OFF';
+        } else {
+            autoRefreshInterval = setInterval(refreshDashboard, 60000); // 60 seconds
+            btn.textContent = '🔁 Auto-Refresh: ON (60s)';
+        }
+    }
+
+    // Export data as JSON
+    function exportData() {
+        if (!storageData) return;
+        const dataStr = JSON.stringify(storageData, null, 2);
+        const dataBlob = new Blob([dataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(dataBlob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `storage-data-${new Date().toISOString().split('T')[0]}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+    }
+
+
+    function renderOrphanRows(files, zone, badgeClass, badgeLabel, emptyMsg) {
+        const t = 'd' + 'iv';
+        if (!files || !files.length) {
+            return '<' + t + ' class="loading">' + emptyMsg + '</' + t + '>';
+        }
+        return files.map(file => {
+            const title = file.label || file.path.split('/').pop();
+            return `
+                <${t} class="item-row selectable">
+                    <input class="orphan-check" type="checkbox" data-zone="${escapeAttr(zone)}" data-path="${escapeAttr(file.path)}" onchange="updateOrphanDeleteButtons()">
+                    <${t} class="item-name">
+                        ${escapeHtml(title)}
+                        <span class="item-path">${escapeHtml(file.path)}</span>
+                    </${t}>
+                    <span class="item-size">${file.sizeGB.toFixed(2)} GB</span>
+                    <span class="item-badge ${badgeClass}">${badgeLabel} · nlink ${file.nlink}</span>
+                </${t}>
+            `;
+        }).join('');
+    }
+
+    function renderOrphanData(data) {
+        orphanDataCache = data;
+        const status = document.getElementById('orphanScanStatus');
+        const btn = document.getElementById('orphanScanBtn');
+        if (data.scanning) {
+            status.textContent = data.message || 'Scanning...';
+            if (btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
+        } else {
+            status.textContent = data.scannedAt
+                ? 'Last scan: ' + new Date(data.scannedAt).toLocaleString()
+                : (data.message || '');
+            if (btn) { btn.disabled = false; btn.textContent = 'Scan for orphans'; }
+        }
+
+        const t = 'd' + 'iv';
+        const paths = (data.libraryPaths || []).join(', ') || 'auto-detected';
+        document.getElementById('orphanSummary').innerHTML = `
+            <${t} class="stat"><${t} class="stat-label">Torrent orphans</${t}><${t} class="stat-value">${formatGB(data.torrentOrphansGB || 0)}</${t}></${t}>
+            <${t} class="stat"><${t} class="stat-label">Library orphans</${t}><${t} class="stat-value">${formatGB(data.libraryOrphansGB || 0)}</${t}></${t}>
+            <${t} class="stat"><${t} class="stat-label">Torrents root</${t}><${t} class="stat-value" style="font-size:14px">${escapeHtml(data.torrentsPath || '')}</${t}></${t}>
+            <${t} class="stat"><${t} class="stat-label">Library roots</${t}><${t} class="stat-value" style="font-size:14px">${escapeHtml(paths)}</${t}></${t}>
+        `;
+
+        document.getElementById('torrentOrphansList').innerHTML = renderOrphanRows(
+            data.torrentOrphans,
+            'torrents',
+            'badge-orphan-torrent',
+            'Torrent only',
+            'No torrent-only files — everything in torrents appears linked to a library inode.'
+        );
+        document.getElementById('libraryOrphansList').innerHTML = renderOrphanRows(
+            data.libraryOrphans,
+            'library',
+            'badge-orphan-library',
+            'Library only',
+            'No library-only files — everything in movies/TV appears linked to torrents.'
+        );
+        updateOrphanDeleteButtons();
+    }
+
+    function selectedOrphanPaths(zone) {
+        return Array.from(document.querySelectorAll(`.orphan-check[data-zone="${zone}"]:checked`))
+            .map(input => input.dataset.path);
+    }
+
+    function setOrphanSelection(zone, checked) {
+        document.querySelectorAll(`.orphan-check[data-zone="${zone}"]`).forEach(input => {
+            input.checked = checked;
+        });
+        updateOrphanDeleteButtons();
+    }
+
+    function updateOrphanDeleteButtons() {
+        [
+            { zone: 'torrents', statusId: 'torrentDeleteStatus', deleteId: 'torrentDeleteBtn', dryId: 'torrentDryRunBtn' },
+            { zone: 'library', statusId: 'libraryDeleteStatus', deleteId: 'libraryDeleteBtn', dryId: 'libraryDryRunBtn' }
+        ].forEach(config => {
+            const count = selectedOrphanPaths(config.zone).length;
+            const status = document.getElementById(config.statusId);
+            const deleteBtn = document.getElementById(config.deleteId);
+            const dryBtn = document.getElementById(config.dryId);
+            if (status) status.textContent = `${count} selected`;
+            if (deleteBtn) deleteBtn.disabled = count === 0;
+            if (dryBtn) dryBtn.disabled = count === 0;
+        });
+    }
+
+    async function deleteSelectedOrphans(zone, dryRun) {
+        const paths = selectedOrphanPaths(zone);
+        if (!paths.length) return;
+
+        const label = zone === 'torrents' ? 'torrent orphan' : 'movie / TV orphan';
+        if (!dryRun && !confirm(`Delete ${paths.length} selected ${label} file(s)? This removes files from disk.`)) {
+            return;
+        }
+
+        const statusId = zone === 'torrents' ? 'torrentDeleteStatus' : 'libraryDeleteStatus';
+        const status = document.getElementById(statusId);
+        if (status) status.textContent = dryRun ? 'Testing selected files...' : 'Deleting selected files...';
+
+        try {
+            const res = await fetch('/api/orphan-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ zone, paths, dryRun })
+            });
+            if (!res.ok) {
+                throw new Error(await res.text());
+            }
+            const result = await res.json();
+            const failed = result.failed && result.failed.length ? ` · ${result.failed.length} failed` : '';
+            if (status) {
+                status.textContent = `${result.message} · ${formatGB(result.deletedGB || 0)}${failed}`;
+            }
+            await loadOrphanData();
+            if (status) {
+                status.textContent = `${result.message} · ${formatGB(result.deletedGB || 0)}${failed}`;
+            }
+            if (!dryRun) {
+                pollScanStatus();
+            }
+        } catch (e) {
+            if (status) status.textContent = 'Delete failed: ' + e.message;
+        }
+    }
+
+    function startOrphanScan() {
+        fetch('/api/orphan-scan', { method: 'POST' })
+            .then(() => loadOrphanData())
+            .catch(() => {
+                document.getElementById('orphanScanStatus').textContent = 'Failed to start scan';
+            });
+    }
+
+    let orphanPollTimer = null;
+
+    async function loadOrphanData() {
+        try {
+            const res = await fetch('/api/orphan-data');
+            const data = await res.json();
+            renderOrphanData(data);
+            if (data.scanning) {
+                orphanPollTimer = setTimeout(loadOrphanData, 1500);
+            } else if (orphanPollTimer) {
+                clearTimeout(orphanPollTimer);
+                orphanPollTimer = null;
+            }
+        } catch (e) {
+            document.getElementById('orphanScanStatus').textContent = 'Failed to load orphan data';
+        }
+    }
+
+    // Tab switching
+    function switchTab(event, tabName) {
+        // Hide all tabs
+        document.querySelectorAll('.tab-content').forEach(tab => {
+            tab.classList.remove('active');
+        });
+
+        // Remove active class from all buttons
+        document.querySelectorAll('.tab-button').forEach(btn => {
+            btn.classList.remove('active');
+        });
+
+        // Show selected tab
+        document.getElementById(tabName).classList.add('active');
+
+        // Add active class to clicked button
+        event.target.classList.add('active');
+
+        if (tabName === 'orphans') {
+            loadOrphanData();
+        }
+        if (tabName === 'scan') {
+            pollScanStatus();
+        }
+
+        window.requestAnimationFrame(() => {
+            [overviewChart, sunburstChart, sizeDistributionChart].forEach(chart => chart && chart.resize());
+        });
+    }
+
+    function syncLibrary() {
+        const btn = document.getElementById('syncBtn');
+        btn.disabled = true;
+        btn.textContent = 'Syncing...';
+
+        fetch('/refresh-all', { method: 'POST' })
+            .then(() => {
+                pollSyncStatus(btn);
+                pollScanStatus();
+            })
+            .catch(err => {
+                console.error('Sync error:', err);
+                btn.disabled = false;
+                btn.textContent = 'Sync library';
+            });
+    }
+
+    function pollSyncStatus(btn) {
+        fetch('/refresh-status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.isRefreshing) {
+                    btn.textContent = data.message || 'Syncing...';
+                    setTimeout(() => pollSyncStatus(btn), 1000);
+                } else {
+                    btn.disabled = false;
+                    btn.textContent = 'Sync library';
+                    refreshDashboard();
+                }
+            })
+            .catch(() => {
+                btn.disabled = false;
+                btn.textContent = 'Sync library';
+            });
+    }
+
+    window.addEventListener('resize', () => {
+        [overviewChart, sunburstChart, sizeDistributionChart].forEach(chart => chart && chart.resize());
+    });
+
+    // Show error
+    function showError(message) {
+        const cardsContainer = document.getElementById('cardsContainer');
+        cardsContainer.innerHTML = `<div class="error">${message}</div>`;
+    }
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', initDashboard);
+</script>
+{{end}}
