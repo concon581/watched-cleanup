@@ -260,8 +260,12 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:    ":6969",
-		Handler: securityMiddleware(mux),
+		Addr:              ":6969",
+		Handler:           securityMiddleware(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	fmt.Println("watched-cleanup v1.1.0 starting...")
