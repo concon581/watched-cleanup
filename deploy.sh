@@ -23,6 +23,8 @@ echo "📦 Syncing source..."
 rsync -avz --progress \
   --exclude 'watched-cleanup' \
   --exclude '.git' \
+  --exclude '.claude' \
+  --exclude '.codex' \
   --exclude 'deploy.sh' \
   --exclude '.DS_Store' \
   "$LOCAL_PATH/" \
@@ -40,6 +42,7 @@ echo ""
 echo "🔨 Building image and restarting stack on server..."
 ssh "$SERVER" "
   set -e
+  rm -rf $BUILD_PATH/.claude $BUILD_PATH/.codex $BUILD_PATH/.DS_Store
   sudo podman build -t watched-cleanup-watched-cleanup:latest $BUILD_PATH
   sudo cp $BUILD_PATH/.env $STACK_PATH/.env
   sudo chmod 600 $STACK_PATH/.env
