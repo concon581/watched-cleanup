@@ -926,6 +926,17 @@ func normalizeOrphanZone(zone string) string {
 	}
 }
 
+func normalizeDeleteType(deleteType string) string {
+	switch strings.ToLower(strings.TrimSpace(deleteType)) {
+	case "movie", "movies":
+		return "movie"
+	case "season", "seasons":
+		return "season"
+	default:
+		return ""
+	}
+}
+
 func globalDryRunEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("DRY_RUN_MODE"))) {
 	case "true", "1", "yes":
@@ -1278,11 +1289,16 @@ func handleRefreshStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDeletePreview(w http.ResponseWriter, r *http.Request) {
-	deleteType := r.URL.Query().Get("type")
+	rawDeleteType := r.URL.Query().Get("type")
+	deleteType := normalizeDeleteType(rawDeleteType)
 	idsParam := r.URL.Query().Get("ids")
 
-	if deleteType == "" || idsParam == "" {
+	if rawDeleteType == "" || idsParam == "" {
 		http.Error(w, "Missing type or ids parameter", http.StatusBadRequest)
+		return
+	}
+	if deleteType == "" {
+		http.Error(w, "Invalid delete type", http.StatusBadRequest)
 		return
 	}
 
@@ -1411,6 +1427,11 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 
 	if deleteType == "" || idsParam == "" {
 		http.Error(w, "Missing type or ids", http.StatusBadRequest)
+		return
+	}
+	deleteType = normalizeDeleteType(deleteType)
+	if deleteType == "" {
+		http.Error(w, "Invalid delete type", http.StatusBadRequest)
 		return
 	}
 

@@ -42,6 +42,57 @@ func TestGlobalDryRunDisabled(t *testing.T) {
 	}
 }
 
+func TestNormalizeDeleteType(t *testing.T) {
+	tests := map[string]string{
+		"movie":    "movie",
+		"movies":   "movie",
+		" Movie ":  "movie",
+		"season":   "season",
+		"seasons":  "season",
+		"episode":  "",
+		"":         "",
+		"../../tv": "",
+	}
+	for input, want := range tests {
+		if got := normalizeDeleteType(input); got != want {
+			t.Fatalf("normalizeDeleteType(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestDeletePreviewRejectsInvalidType(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/delete-preview?type=episode&ids=abc123", nil)
+	w := httptest.NewRecorder()
+
+	handleDeletePreview(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+}
+
+func TestDeleteConfirmRejectsInvalidType(t *testing.T) {
+	deleteMutex.Lock()
+	isDeleting = false
+	deleteMutex.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/delete-confirm", bytes.NewBufferString("type=episode&ids=abc123"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+
+	handleDeleteConfirm(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+	deleteMutex.RLock()
+	deleting := isDeleting
+	deleteMutex.RUnlock()
+	if deleting {
+		t.Fatal("invalid delete type should not start a delete")
+	}
+}
+
 func TestOrphanDeleteHonorsGlobalDryRun(t *testing.T) {
 	t.Setenv("DRY_RUN_MODE", "true")
 
