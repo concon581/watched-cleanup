@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -178,50 +182,119 @@ func loadEnvFile() {
 	}
 }
 
+// securityMiddleware enforces basic auth (when WEB_PASSWORD is set) and
+// rejects cross-site browser requests so pages on other origins can't drive
+// the mutating endpoints (CSRF / DNS rebinding). /healthz stays open for
+// container health checks.
+func securityMiddleware(next http.Handler) http.Handler {
+	username := os.Getenv("WEB_USERNAME")
+	if username == "" {
+		username = "admin"
+	}
+	password := os.Getenv("WEB_PASSWORD")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				http.Error(w, "Cross-site requests are not allowed", http.StatusForbidden)
+				return
+			}
+		}
+		if password != "" {
+			user, pass, ok := r.BasicAuth()
+			if !ok ||
+				subtle.ConstantTimeCompare([]byte(user), []byte(username)) != 1 ||
+				subtle.ConstantTimeCompare([]byte(pass), []byte(password)) != 1 {
+				w.Header().Set("WWW-Authenticate", `Basic realm="watched-cleanup"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
 func main() {
 	// Load .env file for local development (Docker uses docker-compose.yml)
 	loadEnvFile()
 
 	initTemplates()
 
-	http.HandleFunc("/", handleMovies)
-	http.HandleFunc("/tv", handleTV)
-	http.HandleFunc("/storage", handleStorage)
-	http.HandleFunc("/storage-dashboard", handleStorageDashboard)
-	http.HandleFunc("/api/storage-data", handleStorageAPI)
-	http.HandleFunc("/api/scan-status", handleScanStatusAPI)
-	http.HandleFunc("/api/orphan-data", handleOrphanData)
-	http.HandleFunc("/api/orphan-scan", handleOrphanScan)
-	http.HandleFunc("/api/orphan-delete", handleOrphanDelete)
-	http.HandleFunc("/refresh", handleRefreshMovies)
-	http.HandleFunc("/refresh-tv", handleRefreshTV)
-	http.HandleFunc("/refresh-all", handleRefreshAll)
-	http.HandleFunc("/refresh-status", handleRefreshStatus)
-	http.HandleFunc("/delete-preview", handleDeletePreview)
-	http.HandleFunc("/delete-confirm", handleDeleteConfirm)
-	http.HandleFunc("/delete-progress", handleDeleteProgress)
-	http.HandleFunc("/delete", handleDelete) // Keep for backwards compatibility
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleMovies)
+	mux.HandleFunc("/tv", handleTV)
+	mux.HandleFunc("/storage", handleStorage)
+	mux.HandleFunc("/storage-dashboard", handleStorageDashboard)
+	mux.HandleFunc("/api/storage-data", handleStorageAPI)
+	mux.HandleFunc("/api/scan-status", handleScanStatusAPI)
+	mux.HandleFunc("/api/orphan-data", handleOrphanData)
+	mux.HandleFunc("/api/orphan-scan", handleOrphanScan)
+	mux.HandleFunc("/api/orphan-delete", handleOrphanDelete)
+	mux.HandleFunc("/refresh", handleRefreshMovies)
+	mux.HandleFunc("/refresh-tv", handleRefreshTV)
+	mux.HandleFunc("/refresh-all", handleRefreshAll)
+	mux.HandleFunc("/refresh-status", handleRefreshStatus)
+	mux.HandleFunc("/delete-preview", handleDeletePreview)
+	mux.HandleFunc("/delete-confirm", handleDeleteConfirm)
+	mux.HandleFunc("/delete-progress", handleDeleteProgress)
+	mux.HandleFunc("/healthz", handleHealthz)
 
 	// Test endpoints for Radarr/Sonarr API
-	http.HandleFunc("/test/radarr/movies", handleTestRadarrMovies)
-	http.HandleFunc("/test/radarr/search-path", handleTestRadarrSearchPath)
-	http.HandleFunc("/test/radarr/search-title", handleTestRadarrSearchTitle)
-	http.HandleFunc("/test/sonarr/series", handleTestSonarrSeries)
-	http.HandleFunc("/test/sonarr/search-path", handleTestSonarrSearchPath)
-	http.HandleFunc("/test/sonarr/search-title", handleTestSonarrSearchTitle)
+	mux.HandleFunc("/test/radarr/movies", handleTestRadarrMovies)
+	mux.HandleFunc("/test/radarr/search-path", handleTestRadarrSearchPath)
+	mux.HandleFunc("/test/radarr/search-title", handleTestRadarrSearchTitle)
+	mux.HandleFunc("/test/sonarr/series", handleTestSonarrSeries)
+	mux.HandleFunc("/test/sonarr/search-path", handleTestSonarrSearchPath)
+	mux.HandleFunc("/test/sonarr/search-title", handleTestSonarrSearchTitle)
 
-	fmt.Println("watched-cleanup v1.0.2 - hardlink test starting...")
+	if os.Getenv("WEB_PASSWORD") == "" {
+		fmt.Println("watched-cleanup: WARNING - WEB_PASSWORD is not set; the web UI is unauthenticated")
+	}
+
+	srv := &http.Server{
+		Addr:    ":6969",
+		Handler: securityMiddleware(mux),
+	}
+
+	fmt.Println("watched-cleanup v1.1.0 starting...")
 	fmt.Println("Server starting on :6969")
-	fmt.Println("Test endpoints available:")
-	fmt.Println("  GET /test/radarr/movies - List all Radarr movies")
-	fmt.Println("  GET /test/radarr/search-path?path=<filepath> - Search Radarr by file path")
-	fmt.Println("  GET /test/radarr/search-title?title=<title>&year=<year> - Search Radarr by title and year")
-	fmt.Println("  GET /test/sonarr/series - List all Sonarr series")
-	fmt.Println("  GET /test/sonarr/search-path?path=<filepath> - Search Sonarr by file path")
-	fmt.Println("  GET /test/sonarr/search-title?title=<title> - Search Sonarr by title")
 	startUnifiedScan("startup")
-	http.ListenAndServe(":6969", nil)
 
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		fmt.Println("watched-cleanup: Shutdown signal received")
+		// Let an in-flight deletion finish so files, Radarr/Sonarr, and
+		// Jellyfin don't end up out of sync mid-item.
+		deadline := time.Now().Add(4 * time.Minute)
+		for time.Now().Before(deadline) {
+			deleteMutex.RLock()
+			deleting := isDeleting
+			deleteMutex.RUnlock()
+			if !deleting {
+				break
+			}
+			fmt.Println("watched-cleanup: Waiting for in-flight deletion to finish...")
+			time.Sleep(2 * time.Second)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("watched-cleanup: server error: %v", err)
+	}
+	fmt.Println("watched-cleanup: Server stopped")
 }
 
 func updateProgress(current, total int, message string) {
@@ -744,28 +817,6 @@ func collectOrphanScan() (models.OrphanScanResponse, error) {
 	return resp, nil
 }
 
-func runOrphanScan() {
-	orphanMutex.Lock()
-	orphanScanning = true
-	orphanCache.Scanning = true
-	orphanCache.Message = "Walking torrents and library folders (inode scan)..."
-	orphanMutex.Unlock()
-
-	resp, err := collectOrphanScan()
-	if err != nil {
-		orphanMutex.Lock()
-		orphanScanning = false
-		orphanCache = resp
-		orphanMutex.Unlock()
-		return
-	}
-
-	orphanMutex.Lock()
-	orphanScanning = false
-	orphanCache = resp
-	orphanMutex.Unlock()
-}
-
 func enrichOrphanEntries(files []filesystem.OrphanFile, zone string) []models.OrphanFileEntry {
 	pathToMovie := make(map[string]string)
 	cacheMutex.RLock()
@@ -821,27 +872,23 @@ func handleOrphanScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	orphanMutex.Lock()
-	status := scanStatusSnapshot()
-	if orphanScanning || status.Scanning {
-		orphanMutex.Unlock()
-		w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
+
+	// startUnifiedScan is the single-flight guard; no separate check-then-set.
+	if !startUnifiedScan("orphan scan") {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"scanning": true,
 			"message":  "Scan already in progress",
 		})
 		return
 	}
-	orphanMutex.Unlock()
 
 	orphanMutex.Lock()
 	orphanScanning = true
 	orphanCache.Scanning = true
 	orphanCache.Message = "Queued as part of unified storage scan..."
 	orphanMutex.Unlock()
-	startUnifiedScan("orphan scan")
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"scanning": true,
 		"message":  "Unified storage scan started",
@@ -1307,6 +1354,13 @@ func handleDeletePreview(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
+	// Deletion is destructive: POST only, so simple links, prefetchers, and
+	// cross-site GETs can never trigger it.
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var deleteType, idsParam string
 	dryRun := false
 
@@ -1318,38 +1372,27 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("watched-cleanup: DRY_RUN_MODE environment variable is enabled - all deletions will be in test mode\n")
 	}
 
-	// Support both GET (query params) and POST (form/JSON)
-	if r.Method == "POST" {
-		if r.Header.Get("Content-Type") == "application/json" {
-			var req struct {
-				Type   string `json:"type"`
-				Ids    string `json:"ids"`
-				DryRun bool   `json:"dryRun"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
-				deleteType = req.Type
-				idsParam = req.Ids
-				// Only use request dryRun if env var is not set
-				if envDryRun == "" {
-					dryRun = req.DryRun
-				}
-			}
-		} else {
-			// Form data
-			deleteType = r.FormValue("type")
-			idsParam = r.FormValue("ids")
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var req struct {
+			Type   string `json:"type"`
+			Ids    string `json:"ids"`
+			DryRun bool   `json:"dryRun"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+			deleteType = req.Type
+			idsParam = req.Ids
 			// Only use request dryRun if env var is not set
 			if envDryRun == "" {
-				dryRun = r.FormValue("dryRun") == "true" || r.FormValue("test") == "true"
+				dryRun = req.DryRun
 			}
 		}
 	} else {
-		// GET request
-		deleteType = r.URL.Query().Get("type")
-		idsParam = r.URL.Query().Get("ids")
+		// Form data
+		deleteType = r.FormValue("type")
+		idsParam = r.FormValue("ids")
 		// Only use request dryRun if env var is not set
 		if envDryRun == "" {
-			dryRun = r.URL.Query().Get("dryRun") == "true" || r.URL.Query().Get("test") == "true"
+			dryRun = r.FormValue("dryRun") == "true" || r.FormValue("test") == "true"
 		}
 	}
 
@@ -1397,9 +1440,12 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	deleteMutex.Unlock()
 
-	// Show progress modal immediately
+	// Show progress modal immediately (render a snapshot taken under lock)
+	deleteMutex.RLock()
+	progressSnapshot := deleteProgress
+	deleteMutex.RUnlock()
 	w.Header().Set("Content-Type", "text/html")
-	deleteProgressTmpl.Execute(w, deleteProgress)
+	deleteProgressTmpl.Execute(w, progressSnapshot)
 
 	// Start deletion in background
 	go deletion.PerformDelete(httpClient, ids, deleteType, dryRun, &deleteProgress, &deleteResult, &cacheMutex, &cachedMovies, &cachedSeries, &deleteMutex, &isDeleting)
@@ -1435,128 +1481,6 @@ func splitIDs(idsParam string) []string {
 		}
 	}
 	return ids
-}
-
-func handleDelete(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Ids  []string `json:"ids"`
-		Type string   `json:"type"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-
-	var deletedHardlinks []string
-
-	for _, id := range req.Ids {
-		var filesToCheck []string
-
-		// Handle different types differently
-		if req.Type == "season" {
-			// For seasons, we need to get all episodes first
-			fmt.Printf("watched-cleanup: Fetching episodes for season %s\n", id)
-
-			seasonEpisodesBody, err := jellyfin.FetchAPI(httpClient, "season_episodes", id)
-			if err != nil {
-				fmt.Printf("  Error fetching season episodes: %v\n", err)
-				continue
-			}
-
-			var seasonEpisodes models.EpisodeList
-			if err := json.Unmarshal(seasonEpisodesBody, &seasonEpisodes); err != nil {
-				fmt.Printf("  Error unmarshaling season episodes: %v\n", err)
-				continue
-			}
-
-			fmt.Printf("  Found %d episodes in season\n", len(seasonEpisodes.Items))
-
-			// Get the path for each episode
-			for _, ep := range seasonEpisodes.Items {
-				episodeDetailsBody, err := jellyfin.FetchAPI(httpClient, "episode_details", ep.Id)
-				if err != nil {
-					continue
-				}
-				var details models.MovieDetails
-				if err := json.Unmarshal(episodeDetailsBody, &details); err != nil {
-					continue
-				}
-				if len(details.MediaSources) > 0 {
-					path := details.MediaSources[0].Path
-					if path != "" {
-						filesToCheck = append(filesToCheck, path)
-						fmt.Printf("    Episode file: %s\n", filepath.Base(path))
-					}
-				}
-			}
-		} else if req.Type == "movie" {
-			// For movies, get the single file path
-			detailsBody, err := jellyfin.FetchAPI(httpClient, "movie_details", id)
-			if err == nil {
-				var details models.MovieDetails
-				json.Unmarshal(detailsBody, &details)
-				if len(details.MediaSources) > 0 {
-					path := details.MediaSources[0].Path
-					if path != "" {
-						filesToCheck = append(filesToCheck, path)
-						fmt.Printf("watched-cleanup: Movie file: %s\n", path)
-					}
-				}
-			}
-		}
-
-		// 2. Find and delete hardlinks for all files
-		if len(filesToCheck) > 0 {
-			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
-
-			for _, filePath := range filesToCheck {
-				// Check if file exists
-				if _, err := os.Stat(filePath); os.IsNotExist(err) {
-					fmt.Printf("  File doesn't exist (already deleted?): %s\n", filePath)
-					continue
-				}
-
-				hardlinks, err := filesystem.FindHardlinks(filePath, "/data/torrents")
-				if err != nil {
-					fmt.Printf("  Error finding hardlinks for %s: %v\n", filePath, err)
-					continue
-				}
-
-				if len(hardlinks) > 0 {
-					fmt.Printf("  Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
-					for _, link := range hardlinks {
-						fmt.Printf("    Deleting hardlink: %s\n", link)
-						if err := os.Remove(link); err != nil {
-							fmt.Printf("    Error deleting %s: %v\n", link, err)
-						} else {
-							deletedHardlinks = append(deletedHardlinks, link)
-						}
-					}
-				} else {
-					fmt.Printf("  No hardlinks found for %s\n", filepath.Base(filePath))
-				}
-
-				// Delete the original file
-				fmt.Printf("  Deleting original file: %s\n", filePath)
-				if err := os.Remove(filePath); err != nil {
-					fmt.Printf("  Error deleting original: %v\n", err)
-				}
-			}
-		}
-
-		// 3. Tell Jellyfin to delete the item from its database
-		fmt.Printf("  Deleting from Jellyfin database: %s\n", id)
-		jellyfin.CallJellyfinDelete(httpClient, id)
-	}
-
-	responseMsg := fmt.Sprintf("Successfully deleted %d %s(s)", len(req.Ids), req.Type)
-	if len(deletedHardlinks) > 0 {
-		responseMsg += fmt.Sprintf(" and %d hardlinked torrent file(s)", len(deletedHardlinks))
-	}
-
-	fmt.Printf("watched-cleanup: Complete. %s\n", responseMsg)
-	w.Write([]byte(responseMsg))
 }
 
 // Test handlers for Radarr/Sonarr API

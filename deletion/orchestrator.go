@@ -42,7 +42,9 @@ func UpdateProgressStages(progressPtr *models.DeleteProgress, mutex *sync.RWMute
 	mutex.Unlock()
 }
 
-// PerformDelete executes the deletion process for movies or seasons
+// PerformDelete executes the deletion process for movies or seasons.
+// Stage order matters: Radarr/Sonarr is unmonitored BEFORE files are deleted,
+// otherwise a failed unmonitor after deletion triggers an automatic re-download.
 func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun bool, progressPtr *models.DeleteProgress, resultPtr *models.DeleteResult, cacheMutex *sync.RWMutex, cachedMovies *models.MovieList, cachedSeries *[]models.Series, deleteMutex *sync.RWMutex, isDeletingPtr *bool) {
 	mode := "deletion"
 	if dryRun {
@@ -72,6 +74,21 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 	}
 	fmt.Printf("watched-cleanup: Using hardlink search directory: %s\n", hardlinkSearchDir)
 
+	// Index the torrents tree once so each file's hardlinks are an O(1) lookup
+	// instead of a full recursive walk per file.
+	var linkIndex filesystem.LinkIndex
+	if _, err := os.Stat(hardlinkSearchDir); os.IsNotExist(err) {
+		fmt.Printf("watched-cleanup: Hardlink search directory doesn't exist, skipping hardlink checks: %s\n", hardlinkSearchDir)
+	} else {
+		idx, err := filesystem.BuildLinkIndex(hardlinkSearchDir)
+		if err != nil {
+			// A partial index only means some hardlinks go undetected; the
+			// orphan scan will surface those later, so keep what we have.
+			fmt.Printf("watched-cleanup: Warning - error indexing %s: %v\n", hardlinkSearchDir, err)
+		}
+		linkIndex = idx
+	}
+
 	for i, id := range ids {
 		var filesToCheck []string
 		var itemName string
@@ -79,6 +96,18 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 		var episodeTotal int
 		var episodeInodeComplete int
 		var stageErrors []string
+
+		modePrefix := ""
+		if dryRun {
+			modePrefix = "[TEST] "
+		}
+
+		// Local stage statuses so every progress update is consistent and we
+		// never read progressPtr fields without the lock.
+		stInode, stArr, stJelly := "pending", "pending", "pending"
+		setStages := func() {
+			UpdateProgressStages(progressPtr, deleteMutex, stJelly, stInode, stArr, episodeInodeComplete, episodeTotal, stageErrors)
+		}
 
 		// Initialize item tracking
 		currentItem := models.DeletedItem{
@@ -92,22 +121,20 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 			},
 		}
 
-		// Handle different types differently
+		// Gather file paths and metadata for the item
 		if deleteType == "season" {
-			modePrefix := ""
-			if dryRun {
-				modePrefix = "[TEST] "
-			}
 			fmt.Printf("watched-cleanup: Processing season %d/%d (ID: %s)\n", i+1, len(ids), id)
 			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("%sProcessing season %d of %d", modePrefix, i+1, len(ids)), "")
-			UpdateProgressStages(progressPtr, deleteMutex, "pending", "pending", "pending", 0, 0, []string{})
+			setStages()
 
 			seasonEpisodesBody, err := jellyfin.FetchAPI(client, "season_episodes", id)
 			if err != nil {
 				errMsg := fmt.Sprintf("Error fetching season episodes: %v", err)
 				fmt.Printf("watched-cleanup: %s\n", errMsg)
 				globalErrors = append(globalErrors, errMsg)
-				UpdateProgressStages(progressPtr, deleteMutex, "error", "pending", "pending", 0, 0, []string{errMsg})
+				stageErrors = append(stageErrors, errMsg)
+				stJelly = "error"
+				setStages()
 				continue
 			}
 
@@ -116,7 +143,9 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 				errMsg := fmt.Sprintf("Error parsing season episodes: %v", err)
 				fmt.Printf("watched-cleanup: %s\n", errMsg)
 				globalErrors = append(globalErrors, errMsg)
-				UpdateProgressStages(progressPtr, deleteMutex, "error", "pending", "pending", 0, 0, []string{errMsg})
+				stageErrors = append(stageErrors, errMsg)
+				stJelly = "error"
+				setStages()
 				continue
 			}
 
@@ -136,10 +165,7 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 			cacheMutex.RUnlock()
 			fmt.Printf("watched-cleanup: Season name: %s (%.2f GB)\n", itemName, itemSizeGB)
 
-			// Initialize episode tracking
 			episodeTotal = len(seasonEpisodes.Items)
-			episodeInodeComplete = 0
-			stageErrors = []string{}
 
 			// Collect all episode files first
 			for _, ep := range seasonEpisodes.Items {
@@ -161,19 +187,10 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 					}
 				}
 			}
-
-			// Process each episode through all 3 stages
-			UpdateProgressStages(progressPtr, deleteMutex, "pending", "processing", "pending", 0, episodeTotal, []string{})
 		} else if deleteType == "movie" {
-			modePrefix := ""
-			if dryRun {
-				modePrefix = "[TEST] "
-			}
-			episodeTotal = 0
-			stageErrors = []string{}
 			fmt.Printf("watched-cleanup: Processing movie %d/%d (ID: %s)\n", i+1, len(ids), id)
 			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("%sProcessing movie %d of %d", modePrefix, i+1, len(ids)), "")
-			UpdateProgressStages(progressPtr, deleteMutex, "pending", "pending", "pending", 0, 0, []string{})
+			setStages()
 
 			detailsBody, err := jellyfin.FetchAPI(client, "movie_details", id)
 			if err != nil {
@@ -212,133 +229,14 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 			}
 		}
 
-		// Find and delete hardlinks - Stage 1: Inode/Hardlink matching
-		currentItem.StageResults.Inode.Status = "processing"
-		currentItem.StageResults.Inode.Details = []string{}
-		filesDeleted := 0
-
-		if len(filesToCheck) > 0 {
-			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
-			episodeIndex := 0
-			for _, filePath := range filesToCheck {
-				if deleteType == "season" {
-					episodeIndex++
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", "processing", "pending", episodeIndex, episodeTotal, stageErrors)
-					UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("Stage 1: Processing episode %d/%d - Inode/Hardlink", episodeIndex, episodeTotal), filepath.Base(filePath))
-				} else {
-					progressMsg := fmt.Sprintf("Stage 1: Deleting files for %s", itemName)
-					if dryRun {
-						progressMsg = fmt.Sprintf("[TEST] Stage 1: Would delete files for %s", itemName)
-					}
-					UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, filepath.Base(filePath))
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", "processing", "pending", 0, 0, []string{})
-				}
-				fmt.Printf("watched-cleanup: Processing file: %s\n", filePath)
-
-				if _, err := os.Stat(filePath); os.IsNotExist(err) {
-					fmt.Printf("watched-cleanup: File doesn't exist (already deleted?): %s\n", filePath)
-					continue
-				}
-
-				// Check if hardlink search directory exists
-				if _, err := os.Stat(hardlinkSearchDir); os.IsNotExist(err) {
-					fmt.Printf("watched-cleanup: Hardlink search directory doesn't exist, skipping hardlink check: %s\n", hardlinkSearchDir)
-				} else {
-					hardlinks, err := filesystem.FindHardlinks(filePath, hardlinkSearchDir)
-					if err != nil {
-						errMsg := fmt.Sprintf("Error finding hardlinks for %s: %v", filePath, err)
-						fmt.Printf("watched-cleanup: %s\n", errMsg)
-						currentItem.Errors = append(currentItem.Errors, errMsg)
-						globalErrors = append(globalErrors, errMsg)
-					} else {
-						if len(hardlinks) > 0 {
-							fmt.Printf("watched-cleanup: Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
-							for _, link := range hardlinks {
-								if dryRun {
-									fmt.Printf("watched-cleanup: [DRY-RUN] Would delete hardlink: %s\n", link)
-									currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
-								} else {
-									fmt.Printf("watched-cleanup: Deleting hardlink: %s\n", link)
-									if err := os.Remove(link); err != nil {
-										errMsg := fmt.Sprintf("Error deleting hardlink %s: %v", link, err)
-										fmt.Printf("watched-cleanup: %s\n", errMsg)
-										currentItem.Errors = append(currentItem.Errors, errMsg)
-										globalErrors = append(globalErrors, errMsg)
-									} else {
-										currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
-										fmt.Printf("watched-cleanup: Successfully deleted hardlink: %s\n", link)
-									}
-								}
-							}
-						} else {
-							fmt.Printf("watched-cleanup: No hardlinks found for %s\n", filepath.Base(filePath))
-						}
-					}
-				}
-
-				// Delete the original file
-				if dryRun {
-					fmt.Printf("watched-cleanup: [DRY-RUN] Would delete original file: %s\n", filePath)
-					filesDeleted++
-				} else {
-					fmt.Printf("watched-cleanup: Deleting original file: %s\n", filePath)
-					if err := os.Remove(filePath); err != nil {
-						errMsg := fmt.Sprintf("Error deleting %s: %v", filePath, err)
-						fmt.Printf("watched-cleanup: %s\n", errMsg)
-						currentItem.Errors = append(currentItem.Errors, errMsg)
-						globalErrors = append(globalErrors, errMsg)
-					} else {
-						fmt.Printf("watched-cleanup: Successfully deleted file: %s\n", filePath)
-						filesDeleted++
-					}
-				}
-				// Mark episode as complete for inode stage (for seasons)
-				if deleteType == "season" {
-					episodeInodeComplete++
-				}
-			}
-			currentItem.FilesDeleted = filesDeleted
-			// Mark inode stage as complete after processing all files
-			if deleteType == "season" {
-				if episodeInodeComplete == episodeTotal {
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", "complete", "pending", episodeInodeComplete, episodeTotal, stageErrors)
-					currentItem.StageResults.Inode.Status = "success"
-					currentItem.StageResults.Inode.Message = fmt.Sprintf("Deleted %d files and %d hardlinks", filesDeleted, len(currentItem.HardlinksDeleted))
-				} else {
-					errMsg := fmt.Sprintf("Inode stage: Only %d/%d episodes completed", episodeInodeComplete, episodeTotal)
-					stageErrors = append(stageErrors, errMsg)
-					currentItem.Errors = append(currentItem.Errors, errMsg)
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", "error", "pending", episodeInodeComplete, episodeTotal, stageErrors)
-					currentItem.StageResults.Inode.Status = "error"
-					currentItem.StageResults.Inode.Message = errMsg
-				}
-			} else {
-				// For movies, mark inode stage complete
-				UpdateProgressStages(progressPtr, deleteMutex, "pending", "complete", "pending", 0, 0, []string{})
-				currentItem.StageResults.Inode.Status = "success"
-				currentItem.StageResults.Inode.Message = fmt.Sprintf("Deleted %d files and %d hardlinks", filesDeleted, len(currentItem.HardlinksDeleted))
-			}
-		} else {
-			fmt.Printf("watched-cleanup: No files to delete for %s\n", itemName)
-			if deleteType == "season" {
-				UpdateProgressStages(progressPtr, deleteMutex, "pending", "error", "pending", 0, episodeTotal, []string{"No files found to delete"})
-			} else {
-				UpdateProgressStages(progressPtr, deleteMutex, "pending", "error", "pending", 0, 0, []string{"No files found to delete"})
-			}
-			currentItem.StageResults.Inode.Status = "error"
-			currentItem.StageResults.Inode.Message = "No files found to delete"
-		}
-
-		// Stage 2: Unmonitor in Sonarr/Radarr before deleting from Jellyfin
+		// Stage 1: Unmonitor in Radarr/Sonarr while the files still exist,
+		// so a failure here means nothing has been deleted yet.
 		currentItem.StageResults.RadarrSonarr.Status = "processing"
-		UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "processing", progressPtr.EpisodeCurrent, progressPtr.EpisodeTotal, progressPtr.StageErrors)
+		stArr = "processing"
+		setStages()
 		if deleteType == "movie" {
 			fmt.Printf("watched-cleanup: Attempting to unmonitor movie in Radarr: %s\n", itemName)
-			progressMsg := fmt.Sprintf("Stage 2: Unmonitoring in Radarr: %s", itemName)
-			if dryRun {
-				progressMsg = fmt.Sprintf("[TEST] Stage 2: Would unmonitor in Radarr: %s", itemName)
-			}
-			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, "")
+			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("%sStage 1: Unmonitoring in Radarr: %s", modePrefix, itemName), "")
 
 			var radarrMovie *models.RadarrMovie
 			var err error
@@ -376,7 +274,7 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 					fmt.Printf("watched-cleanup: [DRY-RUN] Would unmonitor movie %s (ID: %d) in Radarr\n", itemName, radarrMovie.Id)
 					currentItem.StageResults.RadarrSonarr.Status = "success"
 					currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Would unmonitor in Radarr (ID: %d)", radarrMovie.Id)
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "complete", 0, 0, []string{})
+					stArr = "complete"
 				} else {
 					if err := radarr.UnmonitorMovie(client, radarrMovie.Id); err != nil {
 						errMsg := fmt.Sprintf("Failed to unmonitor movie %s in Radarr: %v", itemName, err)
@@ -385,13 +283,13 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 						globalErrors = append(globalErrors, errMsg)
 						stageErrors = append(stageErrors, errMsg)
 						currentItem.StageResults.RadarrSonarr.Status = "error"
-						currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Failed to unmonitor in Radarr")
-						UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "error", 0, 0, stageErrors)
+						currentItem.StageResults.RadarrSonarr.Message = "Failed to unmonitor in Radarr"
+						stArr = "error"
 					} else {
 						fmt.Printf("watched-cleanup: Successfully unmonitored movie %s in Radarr\n", itemName)
 						currentItem.StageResults.RadarrSonarr.Status = "success"
 						currentItem.StageResults.RadarrSonarr.Message = "Successfully unmonitored in Radarr"
-						UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "complete", 0, 0, []string{})
+						stArr = "complete"
 					}
 				}
 			} else {
@@ -402,15 +300,12 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 				stageErrors = append(stageErrors, errMsg)
 				currentItem.StageResults.RadarrSonarr.Status = "error"
 				currentItem.StageResults.RadarrSonarr.Message = "Not found in Radarr"
-				UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "error", 0, 0, stageErrors)
+				stArr = "error"
 			}
+			setStages()
 		} else if deleteType == "season" {
 			fmt.Printf("watched-cleanup: Attempting to unmonitor season in Sonarr: %s\n", itemName)
-			progressMsg := fmt.Sprintf("Stage 2: Unmonitoring in Sonarr: %s", itemName)
-			if dryRun {
-				progressMsg = fmt.Sprintf("[TEST] Stage 2: Would unmonitor in Sonarr: %s", itemName)
-			}
-			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, "")
+			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("%sStage 1: Unmonitoring in Sonarr: %s", modePrefix, itemName), "")
 
 			var sonarrSeries *models.SonarrSeries
 			var seasonNumber int
@@ -458,7 +353,7 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 					fmt.Printf("watched-cleanup: [DRY-RUN] Would unmonitor season %s (Series ID: %d, Season: %d) in Sonarr\n", itemName, sonarrSeries.Id, seasonNumber)
 					currentItem.StageResults.RadarrSonarr.Status = "success"
 					currentItem.StageResults.RadarrSonarr.Message = fmt.Sprintf("Would unmonitor in Sonarr (ID: %d, Season: %d)", sonarrSeries.Id, seasonNumber)
-					UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "complete", episodeTotal, episodeTotal, []string{})
+					stArr = "complete"
 				} else {
 					if err := sonarr.UnmonitorSeason(client, sonarrSeries.Id, seasonNumber); err != nil {
 						errMsg := fmt.Sprintf("Failed to unmonitor season %s in Sonarr: %v", itemName, err)
@@ -468,12 +363,12 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 						stageErrors = append(stageErrors, errMsg)
 						currentItem.StageResults.RadarrSonarr.Status = "error"
 						currentItem.StageResults.RadarrSonarr.Message = "Failed to unmonitor in Sonarr"
-						UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "error", episodeTotal, episodeTotal, stageErrors)
+						stArr = "error"
 					} else {
 						fmt.Printf("watched-cleanup: Successfully unmonitored season %s in Sonarr\n", itemName)
 						currentItem.StageResults.RadarrSonarr.Status = "success"
 						currentItem.StageResults.RadarrSonarr.Message = "Successfully unmonitored in Sonarr"
-						UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "complete", episodeTotal, episodeTotal, []string{})
+						stArr = "complete"
 					}
 				}
 			} else {
@@ -484,13 +379,120 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 				stageErrors = append(stageErrors, errMsg)
 				currentItem.StageResults.RadarrSonarr.Status = "error"
 				currentItem.StageResults.RadarrSonarr.Message = "Not found in Sonarr"
-				UpdateProgressStages(progressPtr, deleteMutex, "pending", progressPtr.StageInode, "error", episodeTotal, episodeTotal, stageErrors)
+				stArr = "error"
 			}
+			setStages()
+		}
+
+		// Stage 2: Delete hardlinks and original files
+		currentItem.StageResults.Inode.Status = "processing"
+		currentItem.StageResults.Inode.Details = []string{}
+		stInode = "processing"
+		setStages()
+		filesDeleted := 0
+
+		if len(filesToCheck) > 0 {
+			fmt.Printf("watched-cleanup: Checking %d file(s) for hardlinks\n", len(filesToCheck))
+			episodeIndex := 0
+			for _, filePath := range filesToCheck {
+				if deleteType == "season" {
+					episodeIndex++
+					UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), fmt.Sprintf("%sStage 2: Processing episode %d/%d - Inode/Hardlink", modePrefix, episodeIndex, episodeTotal), filepath.Base(filePath))
+				} else {
+					progressMsg := fmt.Sprintf("Stage 2: Deleting files for %s", itemName)
+					if dryRun {
+						progressMsg = fmt.Sprintf("[TEST] Stage 2: Would delete files for %s", itemName)
+					}
+					UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, filepath.Base(filePath))
+				}
+				setStages()
+				fmt.Printf("watched-cleanup: Processing file: %s\n", filePath)
+
+				if _, err := os.Stat(filePath); os.IsNotExist(err) {
+					fmt.Printf("watched-cleanup: File doesn't exist (already deleted?): %s\n", filePath)
+					continue
+				}
+
+				if linkIndex != nil {
+					hardlinks, err := linkIndex.Lookup(filePath)
+					if err != nil {
+						errMsg := fmt.Sprintf("Error finding hardlinks for %s: %v", filePath, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+					} else if len(hardlinks) > 0 {
+						fmt.Printf("watched-cleanup: Found %d hardlink(s) for %s\n", len(hardlinks), filepath.Base(filePath))
+						for _, link := range hardlinks {
+							if dryRun {
+								fmt.Printf("watched-cleanup: [DRY-RUN] Would delete hardlink: %s\n", link)
+								currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
+							} else {
+								fmt.Printf("watched-cleanup: Deleting hardlink: %s\n", link)
+								if err := os.Remove(link); err != nil {
+									errMsg := fmt.Sprintf("Error deleting hardlink %s: %v", link, err)
+									fmt.Printf("watched-cleanup: %s\n", errMsg)
+									currentItem.Errors = append(currentItem.Errors, errMsg)
+									globalErrors = append(globalErrors, errMsg)
+								} else {
+									currentItem.HardlinksDeleted = append(currentItem.HardlinksDeleted, link)
+									fmt.Printf("watched-cleanup: Successfully deleted hardlink: %s\n", link)
+								}
+							}
+						}
+					} else {
+						fmt.Printf("watched-cleanup: No hardlinks found for %s\n", filepath.Base(filePath))
+					}
+				}
+
+				// Delete the original file
+				if dryRun {
+					fmt.Printf("watched-cleanup: [DRY-RUN] Would delete original file: %s\n", filePath)
+					filesDeleted++
+				} else {
+					fmt.Printf("watched-cleanup: Deleting original file: %s\n", filePath)
+					if err := os.Remove(filePath); err != nil {
+						errMsg := fmt.Sprintf("Error deleting %s: %v", filePath, err)
+						fmt.Printf("watched-cleanup: %s\n", errMsg)
+						currentItem.Errors = append(currentItem.Errors, errMsg)
+						globalErrors = append(globalErrors, errMsg)
+					} else {
+						fmt.Printf("watched-cleanup: Successfully deleted file: %s\n", filePath)
+						filesDeleted++
+					}
+				}
+				// Mark episode as complete for inode stage (for seasons)
+				if deleteType == "season" {
+					episodeInodeComplete++
+				}
+			}
+			currentItem.FilesDeleted = filesDeleted
+			// Mark inode stage as complete after processing all files
+			if deleteType == "season" && episodeInodeComplete != episodeTotal {
+				errMsg := fmt.Sprintf("Inode stage: Only %d/%d episodes completed", episodeInodeComplete, episodeTotal)
+				stageErrors = append(stageErrors, errMsg)
+				currentItem.Errors = append(currentItem.Errors, errMsg)
+				currentItem.StageResults.Inode.Status = "error"
+				currentItem.StageResults.Inode.Message = errMsg
+				stInode = "error"
+			} else {
+				currentItem.StageResults.Inode.Status = "success"
+				currentItem.StageResults.Inode.Message = fmt.Sprintf("Deleted %d files and %d hardlinks", filesDeleted, len(currentItem.HardlinksDeleted))
+				stInode = "complete"
+			}
+			setStages()
+		} else {
+			fmt.Printf("watched-cleanup: No files to delete for %s\n", itemName)
+			stageErrors = append(stageErrors, "No files found to delete")
+			currentItem.StageResults.Inode.Status = "error"
+			currentItem.StageResults.Inode.Message = "No files found to delete"
+			stInode = "error"
+			setStages()
 		}
 
 		// Stage 3: Delete from Jellyfin
 		currentItem.StageResults.Jellyfin.Status = "processing"
-		UpdateProgressStages(progressPtr, deleteMutex, "processing", progressPtr.StageInode, progressPtr.StageRadarrSonarr, progressPtr.EpisodeCurrent, progressPtr.EpisodeTotal, progressPtr.StageErrors)
+		stJelly = "processing"
+		setStages()
 		if dryRun {
 			fmt.Printf("watched-cleanup: [DRY-RUN] Would delete from Jellyfin database: %s (%s)\n", id, itemName)
 			progressMsg := fmt.Sprintf("[TEST] Stage 3: Would remove from Jellyfin: %s", itemName)
@@ -500,7 +502,7 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, "")
 			currentItem.StageResults.Jellyfin.Status = "success"
 			currentItem.StageResults.Jellyfin.Message = "Would remove from Jellyfin"
-			UpdateProgressStages(progressPtr, deleteMutex, "complete", progressPtr.StageInode, progressPtr.StageRadarrSonarr, episodeTotal, episodeTotal, []string{})
+			stJelly = "complete"
 		} else {
 			fmt.Printf("watched-cleanup: Deleting from Jellyfin database: %s (%s)\n", id, itemName)
 			progressMsg := fmt.Sprintf("Stage 3: Removing from Jellyfin: %s", itemName)
@@ -508,12 +510,23 @@ func PerformDelete(client *http.Client, ids []string, deleteType string, dryRun 
 				progressMsg = fmt.Sprintf("Stage 3: Removing from Jellyfin: %s (%d/%d episodes)", itemName, episodeTotal, episodeTotal)
 			}
 			UpdateProgress(progressPtr, deleteMutex, i+1, len(ids), progressMsg, "")
-			jellyfin.CallJellyfinDelete(client, id)
-			fmt.Printf("watched-cleanup: Jellyfin delete request sent for: %s\n", id)
-			currentItem.StageResults.Jellyfin.Status = "success"
-			currentItem.StageResults.Jellyfin.Message = "Removed from Jellyfin"
-			UpdateProgressStages(progressPtr, deleteMutex, "complete", progressPtr.StageInode, progressPtr.StageRadarrSonarr, episodeTotal, episodeTotal, []string{})
+			if err := jellyfin.CallJellyfinDelete(client, id); err != nil {
+				errMsg := fmt.Sprintf("Failed to remove %s from Jellyfin: %v", itemName, err)
+				fmt.Printf("watched-cleanup: %s\n", errMsg)
+				currentItem.Errors = append(currentItem.Errors, errMsg)
+				globalErrors = append(globalErrors, errMsg)
+				stageErrors = append(stageErrors, errMsg)
+				currentItem.StageResults.Jellyfin.Status = "error"
+				currentItem.StageResults.Jellyfin.Message = "Failed to remove from Jellyfin"
+				stJelly = "error"
+			} else {
+				fmt.Printf("watched-cleanup: Jellyfin delete request sent for: %s\n", id)
+				currentItem.StageResults.Jellyfin.Status = "success"
+				currentItem.StageResults.Jellyfin.Message = "Removed from Jellyfin"
+				stJelly = "complete"
+			}
 		}
+		setStages()
 
 		// Finalize item tracking
 		currentItem.Name = itemName

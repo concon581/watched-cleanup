@@ -1,44 +1,57 @@
 #!/bin/bash
 
-# Deploy watched-cleanup to minipc server
+# Deploy watched-cleanup to the minipc server (Podman + dockge)
+#
+# The server migrated from Docker to Podman (July 2026). The source/build
+# context lives at /docker/appdata/watched-cleanup; the running stack is
+# dockge-managed at /opt/stacks/watched-cleanup (compose.yaml + .env).
+#
 # Usage: ./deploy.sh
 
 set -e  # Exit on any error
 
 SERVER="minipc"
-SERVER_PATH="/docker/appdata/watched-cleanup"
-LOCAL_PATH="/Users/connordixon/Developer/watched-cleanup"
+BUILD_PATH="/docker/appdata/watched-cleanup"
+STACK_PATH="/opt/stacks/watched-cleanup"
+LOCAL_PATH="$(cd "$(dirname "$0")" && pwd)"
 
 echo "🚀 Deploying watched-cleanup to $SERVER..."
 echo ""
 
 # Sync files to server (excluding build artifacts and git)
-echo "📦 Syncing files..."
+echo "📦 Syncing source..."
 rsync -avz --progress \
   --exclude 'watched-cleanup' \
   --exclude '.git' \
   --exclude 'deploy.sh' \
   --exclude '.DS_Store' \
   "$LOCAL_PATH/" \
-  "$SERVER:$SERVER_PATH/"
+  "$SERVER:$BUILD_PATH/"
 
 # Ensure .env exists on server
 if [ -f "$LOCAL_PATH/.env" ]; then
   echo "📄 Syncing .env file..."
-  rsync -avz "$LOCAL_PATH/.env" "$SERVER:$SERVER_PATH/.env"
+  rsync -avz "$LOCAL_PATH/.env" "$SERVER:$BUILD_PATH/.env"
 else
   echo "⚠️  Warning: No .env file found locally. Make sure it exists on the server."
 fi
 
 echo ""
-echo "🔨 Building and restarting container on server..."
-ssh "$SERVER" "cd $SERVER_PATH && docker compose up -d --build"
+echo "🔨 Building image and restarting stack on server..."
+ssh "$SERVER" "
+  set -e
+  sudo podman build -t watched-cleanup-watched-cleanup:latest $BUILD_PATH
+  sudo cp $BUILD_PATH/.env $STACK_PATH/.env
+  sudo chmod 600 $STACK_PATH/.env
+  sudo chown root:root $STACK_PATH/.env
+  cd $STACK_PATH && sudo podman compose up -d
+"
 
 echo ""
 echo "✅ Deployment complete!"
 echo ""
 echo "📊 Check status with:"
-echo "   ssh $SERVER 'docker compose -f $SERVER_PATH/docker-compose.yml ps'"
+echo "   ssh $SERVER 'sudo podman ps --filter name=watched-cleanup'"
 echo ""
 echo "📋 View logs with:"
-echo "   ssh $SERVER 'docker compose -f $SERVER_PATH/docker-compose.yml logs -f'"
+echo "   ssh $SERVER 'sudo podman logs -f watched-cleanup'"

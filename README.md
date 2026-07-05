@@ -21,7 +21,7 @@ The application is organized into focused packages:
 
 ```
 watched-cleanup/
-├── main.go                    (905 lines - HTTP handlers, routing, initialization)
+├── main.go                    (HTTP handlers, routing, auth middleware, initialization)
 ├── models/                    (All type definitions)
 │   └── models.go
 ├── jellyfin/                  (Jellyfin API client)
@@ -66,6 +66,15 @@ RADARR_API_KEY=your_radarr_api_key
 SONARR_BASE_URL=http://sonarr:8989/
 SONARR_API_KEY=your_sonarr_api_key
 ```
+
+### Web UI Authentication (Strongly Recommended)
+```bash
+WEB_USERNAME=admin                  # Basic auth username (default: admin)
+WEB_PASSWORD=your_password_here     # Basic auth password; auth is DISABLED if empty
+```
+
+The UI can delete media files, so set a password. Without one the app logs a
+startup warning and serves the UI unauthenticated.
 
 ### Other Settings
 ```bash
@@ -127,10 +136,12 @@ go build -o watched-cleanup
 - `GET /refresh-status` - Get refresh progress
 
 #### Deletion
-- `POST /delete-preview` - Preview items to be deleted
-- `POST /delete-confirm` - Confirm and start deletion
+- `GET /delete-preview` - Preview items to be deleted (read-only)
+- `POST /delete-confirm` - Confirm and start deletion (POST only)
 - `GET /delete-progress` - Get deletion progress
-- `POST /delete` - Legacy deletion endpoint
+
+#### Health
+- `GET /healthz` - Liveness check (no auth required)
 
 #### Test Endpoints
 - `GET /test/radarr/movies` - List all Radarr movies
@@ -170,10 +181,17 @@ go test ./...
 
 1. **Dry-Run Mode** - Test deletions without actually removing files
 2. **Global Dry-Run** - Set `DRY_RUN_MODE=true` to force all deletions into test mode
-3. **Progress Tracking** - Detailed progress with stage-level error reporting
-4. **Mutex Protection** - Thread-safe operations with proper locking
-5. **Error Collection** - All errors are logged and reported to the user
-6. **HTTP Timeouts** - 30-second timeouts on all external API calls
+3. **Basic Auth** - Web UI protected by username/password (`WEB_PASSWORD`)
+4. **POST-only Deletion** - Destructive endpoints reject GET, and cross-site
+   browser requests are blocked (`Sec-Fetch-Site` check)
+5. **Device-aware Hardlink Matching** - Files are matched by device+inode, so
+   inode collisions across filesystems can never delete the wrong file
+6. **Safe Stage Order** - Radarr/Sonarr is unmonitored *before* files are
+   deleted, so a failed unmonitor can't trigger a re-download of deleted media
+7. **Graceful Shutdown** - SIGTERM waits for an in-flight deletion to finish
+8. **Progress Tracking** - Detailed progress with stage-level error reporting
+9. **Error Collection** - All errors are logged and reported to the user
+10. **HTTP Timeouts** - 30-second timeouts on all external API calls
 
 ## Error Handling
 
@@ -194,6 +212,16 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is provided as-is for personal use.
 
 ## Changelog
+
+### v1.1.0
+- Added basic-auth protection for the web UI (`WEB_USERNAME`/`WEB_PASSWORD`)
+- Deletion endpoints are POST-only; cross-site browser requests are rejected
+- Removed the legacy unauthenticated `/delete` endpoint
+- Hardlink and orphan matching now compare device+inode (safe across multiple mounts)
+- Deletion pipeline reordered: unmonitor in Radarr/Sonarr before deleting files
+- Torrents directory is indexed once per delete run instead of walked per file
+- Jellyfin delete failures are now reported instead of silently ignored
+- Graceful shutdown waits for in-flight deletions; added `/healthz` and a Docker healthcheck
 
 ### v1.0.2
 - Improved error handling and HTTP timeouts

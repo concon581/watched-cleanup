@@ -25,10 +25,10 @@ type OrphanScanResult struct {
 }
 
 type inodeRecord struct {
-	inode  uint64
-	nlink  uint64
-	size   int64
-	paths  []string
+	id    FileID
+	nlink uint64
+	size  int64
+	paths []string
 }
 
 // ScanOrphans finds files that exist only in torrents or only in library paths (by inode).
@@ -51,7 +51,7 @@ func ScanOrphans(torrentsPath string, libraryPaths []string) (OrphanScanResult, 
 	}
 	result.LibraryPaths = cleanLibs
 
-	byInode := make(map[uint64]*inodeRecord)
+	byInode := make(map[FileID]*inodeRecord)
 
 	walkRoots := []string{torrentsPath}
 	walkRoots = append(walkRoots, cleanLibs...)
@@ -71,11 +71,11 @@ func ScanOrphans(torrentsPath string, libraryPaths []string) (OrphanScanResult, 
 			if !ok {
 				return nil
 			}
-			ino := stat.Ino
-			rec, exists := byInode[ino]
+			id := fileIDFromStat(stat)
+			rec, exists := byInode[id]
 			if !exists {
-				rec = &inodeRecord{inode: ino, nlink: uint64(stat.Nlink), size: info.Size()}
-				byInode[ino] = rec
+				rec = &inodeRecord{id: id, nlink: uint64(stat.Nlink), size: info.Size()}
+				byInode[id] = rec
 			}
 			rec.paths = append(rec.paths, path)
 			return nil
@@ -99,7 +99,7 @@ func ScanOrphans(torrentsPath string, libraryPaths []string) (OrphanScanResult, 
 		file := OrphanFile{
 			SizeGB: float64(rec.size) / (1024 * 1024 * 1024),
 			NLink:  rec.nlink,
-			Inode:  rec.inode,
+			Inode:  rec.id.Ino,
 		}
 
 		if inTorrents && !inLibrary {

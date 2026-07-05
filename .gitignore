@@ -28,3 +28,6 @@ watched-cleanup
 *.swp
 *.swo
 *~
+
+# Claude Code local settings
+.claude/

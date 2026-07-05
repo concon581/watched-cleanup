@@ -7,19 +7,69 @@ import (
 	"syscall"
 )
 
-// FindHardlinks finds all hardlinks to a target file by comparing inodes
-func FindHardlinks(targetPath string, searchDir string) ([]string, error) {
-	// Get the inode of the target file
-	targetInfo, err := os.Stat(targetPath)
+// FileID uniquely identifies a file across filesystems. Inode numbers are
+// only unique per device, so both fields are required to match hardlinks
+// safely when DATA_PATH spans multiple mounts (mergerfs, extra disks, NFS).
+type FileID struct {
+	Dev uint64
+	Ino uint64
+}
+
+func fileIDFromStat(stat *syscall.Stat_t) FileID {
+	return FileID{Dev: uint64(stat.Dev), Ino: uint64(stat.Ino)}
+}
+
+// GetFileID returns the device+inode identity of a file.
+func GetFileID(path string) (FileID, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return FileID{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return FileID{}, fmt.Errorf("failed to get stat info for %s", path)
+	}
+	return fileIDFromStat(stat), nil
+}
+
+// LinkIndex maps file identities to every path seen for them under a
+// directory tree. Build it once per delete run instead of walking the
+// torrents directory for every file being deleted.
+type LinkIndex map[FileID][]string
+
+// BuildLinkIndex walks searchDir once and records all regular files by FileID.
+func BuildLinkIndex(searchDir string) (LinkIndex, error) {
+	index := make(LinkIndex)
+	err := filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil // Skip errors, continue walking
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil
+		}
+		id := fileIDFromStat(stat)
+		index[id] = append(index[id], path)
+		return nil
+	})
+	return index, err
+}
+
+// Lookup returns all indexed paths that are hardlinks of targetPath.
+func (idx LinkIndex) Lookup(targetPath string) ([]string, error) {
+	id, err := GetFileID(targetPath)
 	if err != nil {
 		return nil, err
 	}
+	return idx[id], nil
+}
 
-	targetStat, ok := targetInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, fmt.Errorf("failed to get stat info")
+// FindHardlinks finds all hardlinks to a target file by comparing device+inode
+func FindHardlinks(targetPath string, searchDir string) ([]string, error) {
+	targetID, err := GetFileID(targetPath)
+	if err != nil {
+		return nil, err
 	}
-	targetInode := targetStat.Ino
 
 	var matches []string
 
@@ -33,14 +83,13 @@ func FindHardlinks(targetPath string, searchDir string) ([]string, error) {
 			return nil // Skip directories
 		}
 
-		// Get inode of current file
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok {
 			return nil
 		}
 
-		// If inodes match, this is a hardlink
-		if stat.Ino == targetInode {
+		// Same device and inode means this is a hardlink
+		if fileIDFromStat(stat) == targetID {
 			matches = append(matches, path)
 		}
 

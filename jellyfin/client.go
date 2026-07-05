@@ -77,15 +77,14 @@ func FetchAPI(client *http.Client, requestType string, id string) ([]byte, error
 }
 
 // CallJellyfinDelete sends a DELETE request to remove an item from Jellyfin
-func CallJellyfinDelete(client *http.Client, id string) {
+func CallJellyfinDelete(client *http.Client, id string) error {
 	baseurl := os.Getenv("JELLYFIN_BASE_URL")
 	token := os.Getenv("JELLYFIN_API_KEY")
 	url := fmt.Sprintf("%sItems/%s", baseurl, id)
 
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
-		fmt.Printf("watched-cleanup: Error creating Jellyfin delete request: %v\n", err)
-		return
+		return fmt.Errorf("creating Jellyfin delete request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", token))
 
@@ -96,16 +95,15 @@ func CallJellyfinDelete(client *http.Client, id string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("watched-cleanup: Error sending Jellyfin delete request: %v\n", err)
-		return
+		return fmt.Errorf("sending Jellyfin delete request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		fmt.Printf("watched-cleanup: Jellyfin delete successful (HTTP %d)\n", resp.StatusCode)
-	} else {
-		fmt.Printf("watched-cleanup: Jellyfin delete returned HTTP %d\n", resp.StatusCode)
+		return nil
 	}
+	return fmt.Errorf("Jellyfin delete returned HTTP %d", resp.StatusCode)
 }
 
 // FetchMovieData retrieves and enriches movie data from Jellyfin

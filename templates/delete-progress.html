@@ -46,13 +46,13 @@
 
 <div id="progressDetails">
     <div class="stage-progress">
-        <div class="stage-item {{if eq .StageInode "complete"}}stage-complete{{else if eq .StageInode "error"}}stage-error{{else if eq .StageInode "processing"}}stage-processing{{end}}">
-            <strong>1. Inode/Hardlink:</strong> 
-            {{if eq .StageInode "complete"}}✓ Complete{{else if eq .StageInode "error"}}✗ Error{{else if eq .StageInode "processing"}}⟳ Processing...{{else}}⏳ Pending{{end}}
-        </div>
         <div class="stage-item {{if eq .StageRadarrSonarr "complete"}}stage-complete{{else if eq .StageRadarrSonarr "error"}}stage-error{{else if eq .StageRadarrSonarr "processing"}}stage-processing{{end}}">
-            <strong>2. Radarr/Sonarr:</strong> 
+            <strong>1. Radarr/Sonarr:</strong>
             {{if eq .StageRadarrSonarr "complete"}}✓ Complete{{else if eq .StageRadarrSonarr "error"}}✗ Error{{else if eq .StageRadarrSonarr "processing"}}⟳ Processing...{{else}}⏳ Pending{{end}}
+        </div>
+        <div class="stage-item {{if eq .StageInode "complete"}}stage-complete{{else if eq .StageInode "error"}}stage-error{{else if eq .StageInode "processing"}}stage-processing{{end}}">
+            <strong>2. Inode/Hardlink:</strong>
+            {{if eq .StageInode "complete"}}✓ Complete{{else if eq .StageInode "error"}}✗ Error{{else if eq .StageInode "processing"}}⟳ Processing...{{else}}⏳ Pending{{end}}
         </div>
         <div class="stage-item {{if eq .StageJellyfin "complete"}}stage-complete{{else if eq .StageJellyfin "error"}}stage-error{{else if eq .StageJellyfin "processing"}}stage-processing{{end}}">
             <strong>3. Jellyfin:</strong> 

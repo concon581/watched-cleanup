@@ -455,7 +455,11 @@
             btn.disabled = true;
             btn.textContent = 'Starting...';
             
-            fetch('/delete-confirm?type=' + encodeURIComponent(type) + '&ids=' + encodeURIComponent(ids))
+            fetch('/delete-confirm', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ type: type, ids: ids })
+            })
                 .then(r => {
                     if (!r.ok) {
                         throw new Error('HTTP ' + r.status + ': ' + r.statusText);

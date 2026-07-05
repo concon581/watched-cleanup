@@ -18,4 +18,8 @@ services:
       - DATA_PATH=${DATA_PATH:-/data}
       - TORRENTS_PATH=${TORRENTS_PATH:-/data/torrents}
       - DRY_RUN_MODE=${DRY_RUN_MODE:-true}
+      - WEB_USERNAME=${WEB_USERNAME:-admin}
+      - WEB_PASSWORD=${WEB_PASSWORD}
+    # Give an in-flight deletion time to finish before the container is killed
+    stop_grace_period: 4m30s
     restart: unless-stopped
