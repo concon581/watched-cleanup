@@ -926,6 +926,15 @@ func normalizeOrphanZone(zone string) string {
 	}
 }
 
+func globalDryRunEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DRY_RUN_MODE"))) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func cachedOrphanEntries(zone string) map[string]models.OrphanFileEntry {
 	orphanMutex.RLock()
 	defer orphanMutex.RUnlock()
@@ -1000,6 +1009,10 @@ func handleOrphanDelete(w http.ResponseWriter, r *http.Request) {
 	if len(req.Paths) == 0 {
 		http.Error(w, "No paths selected", http.StatusBadRequest)
 		return
+	}
+	if globalDryRunEnabled() {
+		req.DryRun = true
+		fmt.Printf("watched-cleanup: DRY_RUN_MODE environment variable is enabled - orphan delete will be in test mode\n")
 	}
 
 	allowed := cachedOrphanEntries(zone)
@@ -1366,8 +1379,8 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 
 	// Check for global dry-run mode via environment variable
 	// If set, force dry-run mode regardless of request parameters
-	envDryRun := os.Getenv("DRY_RUN_MODE")
-	if envDryRun == "true" || envDryRun == "1" || strings.ToLower(envDryRun) == "yes" {
+	forceDryRun := globalDryRunEnabled()
+	if forceDryRun {
 		dryRun = true
 		fmt.Printf("watched-cleanup: DRY_RUN_MODE environment variable is enabled - all deletions will be in test mode\n")
 	}
@@ -1382,7 +1395,7 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 			deleteType = req.Type
 			idsParam = req.Ids
 			// Only use request dryRun if env var is not set
-			if envDryRun == "" {
+			if !forceDryRun {
 				dryRun = req.DryRun
 			}
 		}
@@ -1391,7 +1404,7 @@ func handleDeleteConfirm(w http.ResponseWriter, r *http.Request) {
 		deleteType = r.FormValue("type")
 		idsParam = r.FormValue("ids")
 		// Only use request dryRun if env var is not set
-		if envDryRun == "" {
+		if !forceDryRun {
 			dryRun = r.FormValue("dryRun") == "true" || r.FormValue("test") == "true"
 		}
 	}

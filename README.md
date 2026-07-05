@@ -79,22 +79,27 @@ startup warning and serves the UI unauthenticated.
 ### Other Settings
 ```bash
 TORRENTS_PATH=/data/torrents        # Directory to search for hardlinks
-DRY_RUN_MODE=false                  # Set to 'true' to enable dry-run mode globally
+DRY_RUN_MODE=false                  # Set to 'true' to simulate all media/orphan deletions
 ```
 
 ## Installation
 
-### Docker (Recommended)
+### Docker / Podman
 
 1. Clone the repository
 2. Copy `.env.example` to `.env` and configure your settings
-3. Run with Docker Compose:
+3. Run with Docker Compose or Podman Compose:
 
 ```bash
 docker-compose up -d
+# or
+podman compose up -d
 ```
 
 The application will be available at `http://localhost:6969`
+
+For the current minipc deployment, use `./deploy.sh`; that server runs a
+dockge-managed root Podman stack. See `DEPLOY.md`.
 
 ### Manual Build
 
@@ -133,7 +138,16 @@ go build -o watched-cleanup
 #### Data Refresh
 - `GET /refresh` - Refresh movie data
 - `GET /refresh-tv` - Refresh TV data
+- `POST /refresh-all` - Run the unified Jellyfin, storage, and orphan scan
 - `GET /refresh-status` - Get refresh progress
+
+#### Storage
+- `GET /storage-dashboard` - Interactive storage and orphan dashboard
+- `GET /api/storage-data` - Cached storage dashboard data
+- `GET /api/scan-status` - Unified scan status
+- `GET /api/orphan-data` - Latest orphan hardlink scan data
+- `POST /api/orphan-scan` - Start a unified scan
+- `POST /api/orphan-delete` - Delete selected orphan files, honoring `DRY_RUN_MODE`
 
 #### Deletion
 - `GET /delete-preview` - Preview items to be deleted (read-only)
@@ -180,7 +194,7 @@ go test ./...
 ## Safety Features
 
 1. **Dry-Run Mode** - Test deletions without actually removing files
-2. **Global Dry-Run** - Set `DRY_RUN_MODE=true` to force all deletions into test mode
+2. **Global Dry-Run** - Set `DRY_RUN_MODE=true` to force media and orphan deletions into test mode
 3. **Basic Auth** - Web UI protected by username/password (`WEB_PASSWORD`)
 4. **POST-only Deletion** - Destructive endpoints reject GET, and cross-site
    browser requests are blocked (`Sec-Fetch-Site` check)

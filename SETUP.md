@@ -35,9 +35,11 @@ This application uses environment variables for configuration. Sensitive informa
 ### Deployment
 
 When you run `./deploy.sh`, it will:
-1. Sync all code files to the server
+1. Sync all code files to the minipc build directory
 2. Separately sync the `.env` file (which is gitignored)
-3. Docker Compose will automatically load variables from `.env`
+3. Rebuild the Podman image and restart the dockge-managed stack
+
+See `DEPLOY.md` for the current minipc paths and useful Podman commands.
 
 ### Security Notes
 
@@ -54,4 +56,5 @@ To test deletions without actually removing files:
 DRY_RUN_MODE=true
 ```
 
+When enabled, movie/season deletion and orphan-file deletion are both simulated.
 Set to `false` or remove this line to enable actual deletions.
